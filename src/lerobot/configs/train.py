@@ -83,6 +83,7 @@ class TrainPipelineConfig(HubMixin):
     # Set `dir` to where you would like to save all of the run outputs. If you run another training session
     # with the same value for `dir` its contents will be overwritten unless you set `resume` to true.
     output_dir: Path | None = None
+    env_eval_output_dir: Path | None = None
     job_name: str | None = None
     # Set `resume` to true to resume a previous run. Pass `--config_path` pointing at either a local
     # checkpoint's train_config.json or a Hub repo id holding `checkpoints/<step>/` subtrees (the

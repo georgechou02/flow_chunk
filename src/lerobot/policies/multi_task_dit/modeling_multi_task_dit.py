@@ -73,7 +73,7 @@ from ..utils import get_output_shape, populate_queues
 
 
 def _sdpa_math_kernel_context():
-    """Force math SDPA for forward-mode AD paths that are unsupported by flash kernels."""
+    """Force math SDPA for higher-order AD paths that are unsupported by flash kernels."""
     if sdpa_kernel is not None and SDPBackend is not None:
         return sdpa_kernel(SDPBackend.MATH)
     if torch.cuda.is_available() and hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "sdp_kernel"):
@@ -86,7 +86,7 @@ def _sdpa_math_kernel_context():
 
 
 def _disabled_autocast_context(device: torch.device):
-    """Run forward-mode AD in full precision to avoid AMP dtype mismatches during backward."""
+    """Run higher-order AD in full precision to avoid AMP dtype mismatches during backward."""
     if device.type in {"cuda", "cpu", "xpu", "hpu", "mps"}:
         return torch.autocast(device_type=device.type, enabled=False)
     return nullcontext()
@@ -100,7 +100,8 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
     name = "multi_task_dit"
 
     def __init__(self, config: MultiTaskDiTConfig, **kwargs):
-        require_package("transformers", extra="multi_task_dit")
+        if config.vision_encoder_type == "clip" or not config.single_task:
+            require_package("transformers", extra="multi_task_dit")
         require_package("diffusers", extra="multi_task_dit")
         super().__init__(config)
         config.validate_features()
@@ -384,7 +385,26 @@ class ObservationEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self._setup_preprocessing(config)
+
+        if config.image_resize_shape is not None:
+            self.do_resize = True
+            self.resize = torchvision.transforms.Resize(
+                size=config.image_resize_shape,
+                interpolation=torchvision.transforms.InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+        else:
+            self.do_resize = False
+
+        if config.image_crop_shape is not None:
+            self.do_crop = True
+            self.center_crop = torchvision.transforms.CenterCrop(config.image_crop_shape)
+            if config.image_crop_is_random:
+                self.maybe_random_crop = torchvision.transforms.RandomCrop(config.image_crop_shape)
+            else:
+                self.maybe_random_crop = self.center_crop
+        else:
+            self.do_crop = False
 
         if config.image_features:
             self.num_cameras = len(config.image_features)
@@ -409,10 +429,21 @@ class ObservationEncoder(nn.Module):
         else:
             self.robot_state_dim = 0
 
-        self.text_dim = config.hidden_dim
-        self.text_encoder = CLIPTextEncoder(model_name=config.text_encoder_name, projection_dim=self.text_dim)
+        self.text_encoder = None
+        if not config.single_task:
+            self.text_encoder = CLIPTextEncoder(
+                model_name=config.text_encoder_name,
+                projection_dim=config.hidden_dim,
+            )
 
-        self._setup_vector_output()
+        total_dim = self.robot_state_dim
+        if self.vision_encoder is not None or self.vision_encoders is not None:
+            encoder_to_check = self.vision_encoder or next(iter(self.vision_encoders))
+            c, h, w = encoder_to_check.get_output_shape()
+            total_dim += c * h * w * self.num_cameras
+        if self.text_encoder is not None:
+            total_dim += config.hidden_dim
+        self.conditioning_dim = total_dim * config.n_obs_steps
 
     def _make_vision_encoder(self) -> nn.Module:
         if self.config.vision_encoder_type == "clip":
@@ -427,42 +458,6 @@ class ObservationEncoder(nn.Module):
         if self.do_crop:
             images = self.maybe_random_crop(images) if self.training else self.center_crop(images)
         return images
-
-    def _setup_preprocessing(self, config):
-        if config.image_resize_shape is not None:
-            self.do_resize = True
-            self.resize = torchvision.transforms.Resize(
-                size=config.image_resize_shape,
-                interpolation=torchvision.transforms.InterpolationMode.BILINEAR,
-                antialias=True,
-            )
-        else:
-            self.do_resize = False
-
-        if config.image_crop_shape is not None:
-            self.do_crop = True
-            self.center_crop = torchvision.transforms.CenterCrop(config.image_crop_shape)
-            if config.image_crop_is_random:
-                self.maybe_random_crop = torchvision.transforms.RandomCrop(config.image_crop_shape)
-            else:
-                self.maybe_random_crop = self.center_crop
-        else:
-            self.do_crop = False
-
-    def _setup_vector_output(self):
-        total_dim = 0
-
-        if self.vision_encoder is not None or self.vision_encoders is not None:
-            encoder_to_check = self.vision_encoder or next(iter(self.vision_encoders))
-            feature_map_shape = encoder_to_check.get_output_shape()
-            c, h, w = feature_map_shape
-            spatial_feature_dim = c * h * w
-            total_dim += spatial_feature_dim * self.num_cameras
-
-        total_dim += self.robot_state_dim
-        total_dim += self.text_dim
-
-        self.conditioning_dim = total_dim * self.config.n_obs_steps
 
     def encode_steps(self, batch: dict) -> Tensor:
         """Encode observations to per-step conditioning features."""
@@ -500,7 +495,7 @@ class ObservationEncoder(nn.Module):
                 )
                 conditioning_feats.append(img_features)
 
-        if self.text_encoder is not None and OBS_LANGUAGE_TOKENS in batch:
+        if self.text_encoder is not None:
             input_ids = batch[OBS_LANGUAGE_TOKENS]  # [batch_size, seq_length]
             attention_mask = batch[OBS_LANGUAGE_ATTENTION_MASK]  # [batch_size, seq_length]
 
@@ -859,6 +854,8 @@ class FlowMatchingObjective(nn.Module):
         self.action_dim = action_dim
         self.horizon = horizon
         self.do_mask_loss_for_padding = do_mask_loss_for_padding
+        if not self.config.gripper_first and self.action_dim < 2:
+            raise ValueError("gripper_first=False requires at least one non-gripper action dimension.")
 
     def _effective_lambda_flow_k(self, train_step: int | None) -> float:
         if train_step is not None and train_step < self.config.pre_train_steps:
@@ -901,20 +898,23 @@ class FlowMatchingObjective(nn.Module):
         if use_kinematic_loss:
             if conditioning_steps is None:
                 raise ValueError("conditioning_steps is required when lambda_flow_k > 0.")
-            predicted_velocity, kinematic_loss, kinematic_valid_ratio = self._compute_kinematic_loss(
-                model=model,
-                batch=batch,
-                data=data,
-                action_sequence=action_sequence,
-                x_t=x_t,
-                t=t,
-                conditioning_vec=conditioning_vec,
-                conditioning_steps=conditioning_steps,
+            predicted_velocity, kinematic_loss, kinematic_valid_ratio, kinematic_jvp_metrics = (
+                self._compute_kinematic_loss(
+                    model=model,
+                    batch=batch,
+                    data=data,
+                    action_sequence=action_sequence,
+                    x_t=x_t,
+                    t=t,
+                    conditioning_vec=conditioning_vec,
+                    conditioning_steps=conditioning_steps,
+                )
             )
         else:
             predicted_velocity = model(x_t, t, conditioning_vec=conditioning_vec)
             kinematic_loss = data.new_zeros(())
             kinematic_valid_ratio = data.new_zeros(())
+            kinematic_jvp_metrics = {}
 
         flow_loss = self._flow_loss(predicted_velocity, target_velocity, batch)
         total_loss = flow_loss + effective_lambda_flow_k * kinematic_loss
@@ -927,9 +927,15 @@ class FlowMatchingObjective(nn.Module):
             "pre_train_steps": int(self.config.pre_train_steps),
             "train_step": int(train_step) if train_step is not None else -1,
             "use_jvp_ak": float(self.config.use_jvp_ak),
+            "use_1_k": float(self.config.use_1_k),
+            "gripper_first": float(self.config.gripper_first),
+            "enable_stochastic": float(self.config.enable_stochastic),
             "total_loss": total_loss.detach().float().item(),
             "kinematic_valid_ratio": kinematic_valid_ratio.detach().float().item(),
         }
+        output_dict.update(
+            {name: value.detach().float().item() for name, value in kinematic_jvp_metrics.items()}
+        )
         return total_loss, output_dict
 
     def _flow_loss(self, predicted_velocity: Tensor, target_velocity: Tensor, batch: dict[str, Tensor]) -> Tensor:
@@ -959,7 +965,41 @@ class FlowMatchingObjective(nn.Module):
         return fps_tensor.reshape(reference.shape[0], *([1] * (reference.ndim - 1)))
 
     def _action_dot(self, action_sequence: Tensor, fps: Tensor) -> Tensor:
-        return (action_sequence[:, 1 : self.horizon + 1] - action_sequence[:, : self.horizon]) * fps
+        if self.config.dct_coe_num == 0:
+            return (action_sequence[:, 1 : self.horizon + 1] - action_sequence[:, : self.horizon]) * fps
+
+        num_samples = self.horizon
+        if action_sequence.shape[1] < num_samples:
+            raise ValueError(
+                f"DCT action derivative requires at least horizon ({num_samples}) action frames, "
+                f"got {action_sequence.shape[1]}"
+            )
+
+        num_modes = self.config.dct_coe_num
+        input_dtype = action_sequence.dtype
+        compute_dtype = torch.float32 if input_dtype in {torch.float16, torch.bfloat16} else input_dtype
+        with _disabled_autocast_context(action_sequence.device):
+            actions = action_sequence[:, :num_samples].to(dtype=compute_dtype)
+            modes = torch.arange(num_modes, device=actions.device, dtype=compute_dtype)
+            sample_points = torch.arange(num_samples, device=actions.device, dtype=compute_dtype) + 0.5
+            alpha = torch.full_like(modes, math.sqrt(2.0 / num_samples))
+            alpha[0] = math.sqrt(1.0 / num_samples)
+
+            phase = math.pi * modes[:, None] * sample_points[None, :] / num_samples
+            basis = alpha[:, None] * torch.cos(phase)
+            coefficients = torch.einsum("bnd,kn->bkd", actions, basis)
+
+            derivative_basis = -alpha[:, None] * (math.pi * modes[:, None] / num_samples) * torch.sin(phase)
+            action_dot = torch.einsum("bkd,kh->bhd", coefficients, derivative_basis)
+            action_dot = action_dot * fps.to(dtype=compute_dtype)
+
+        return action_dot.to(dtype=input_dtype)
+
+    def _kinematic_action_mask(self, reference: Tensor) -> Tensor:
+        mask = torch.ones(self.action_dim, dtype=torch.bool, device=reference.device)
+        if not self.config.gripper_first:
+            mask[-1] = False
+        return mask
 
     def _conditioning_dot(self, conditioning_steps: Tensor, fps: Tensor) -> Tensor:
         if conditioning_steps.shape[1] < 2:
@@ -975,11 +1015,14 @@ class FlowMatchingObjective(nn.Module):
         return conditioning_dot_steps.flatten(start_dim=1)
 
     def _kinematic_valid_mask(self, batch: dict[str, Tensor], data: Tensor, conditioning_steps: Tensor) -> Tensor:
-        pair_valid = torch.ones(data.shape[:2], dtype=torch.bool, device=data.device)
+        kinematic_valid = torch.ones(data.shape[:2], dtype=torch.bool, device=data.device)
 
         if "action_is_pad" in batch:
             action_is_pad = batch["action_is_pad"].to(device=data.device, dtype=torch.bool)
-            pair_valid &= ~action_is_pad[:, : data.shape[1]] & ~action_is_pad[:, 1 : data.shape[1] + 1]
+            action_valid = ~action_is_pad[:, : data.shape[1]]
+            if self.config.dct_coe_num == 0:
+                action_valid &= ~action_is_pad[:, 1 : data.shape[1] + 1]
+            kinematic_valid &= action_valid
 
         obs_pad_key = f"{OBS_STATE}_is_pad"
         if obs_pad_key in batch:
@@ -990,10 +1033,10 @@ class FlowMatchingObjective(nn.Module):
                     f"{tuple(conditioning_steps.shape[:2])}"
                 )
             obs_pair_valid = ~obs_is_pad[:, -2] & ~obs_is_pad[:, -1]
-            pair_valid &= obs_pair_valid[:, None]
-        # If no observation padding mask is present, pair validity is determined by action padding.
+            kinematic_valid &= obs_pair_valid[:, None]
+        # If no observation padding mask is present, validity is determined by action padding.
 
-        return pair_valid
+        return kinematic_valid
 
     def _compute_kinematic_loss(
         self,
@@ -1005,42 +1048,100 @@ class FlowMatchingObjective(nn.Module):
         t: Tensor,
         conditioning_vec: Tensor,
         conditioning_steps: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, dict[str, Tensor]]:
         fps = self._sample_frequency(batch, data)
+        kinematic_action_mask = self._kinematic_action_mask(data)
         a_dot_data = self._action_dot(action_sequence, fps)
+        a_dot_data = a_dot_data * kinematic_action_mask.to(dtype=a_dot_data.dtype)
         conditioning_dot_vec = self._conditioning_dot(conditioning_steps, fps)
+        state_jvp = None
+        action_jvp = None
+        if self.config.enable_stochastic:
+            horizon_index = torch.randint(self.horizon, ()).item()
+            horizon_slice = slice(horizon_index, horizon_index + 1)
+        else:
+            horizon_slice = slice(None)
 
         def flow_vector_field_cond(cond: Tensor) -> Tensor:
-            return model(x_t, t, conditioning_vec=cond)
+            return model(x_t, t, conditioning_vec=cond)[:, horizon_slice]
+
+        if self.config.enable_stochastic:
+            # Keep the primal flow pass eligible for Flash SDPA under the outer AMP context.
+            predicted_velocity = model(x_t, t, conditioning_vec=conditioning_vec)
 
         with _disabled_autocast_context(x_t.device), _sdpa_math_kernel_context():
-            predicted_velocity, v_s_dot = torch.func.jvp(
-                flow_vector_field_cond,
-                (conditioning_vec,),
-                (conditioning_dot_vec,),
-            )
+            if self.config.enable_stochastic:
+                if self.config.use_jvp_ak:
 
-            if self.config.use_jvp_ak:
-                def flow_vector_field_action(actions: Tensor) -> Tensor:
-                    return model(actions, t, conditioning_vec=conditioning_vec)
+                    def flow_vector_field(cond: Tensor, actions: Tensor) -> Tensor:
+                        return model(actions, t, conditioning_vec=cond)[:, horizon_slice]
 
-                _, v_a_k_dot = torch.func.jvp(
-                    flow_vector_field_action,
-                    (x_t,),
-                    (a_dot_data,),
-                )
-                residual = v_s_dot + t.view(-1, 1, 1) * v_a_k_dot - a_dot_data
+                    _, kinematic_dot = torch.autograd.functional.jvp(
+                        flow_vector_field,
+                        (conditioning_vec, x_t),
+                        (conditioning_dot_vec, t.view(-1, 1, 1) * a_dot_data),
+                        create_graph=True,
+                    )
+                else:
+                    _, kinematic_dot = torch.autograd.functional.jvp(
+                        flow_vector_field_cond,
+                        conditioning_vec,
+                        conditioning_dot_vec,
+                        create_graph=True,
+                    )
+                    state_jvp = kinematic_dot
+                    if self.config.use_1_k:
+                        kinematic_dot = (1 - t.view(-1, 1, 1)) * kinematic_dot
+                residual = kinematic_dot - a_dot_data[:, horizon_slice]
             else:
-                residual = v_s_dot - a_dot_data
+                predicted_velocity, v_s_dot = torch.func.jvp(
+                    flow_vector_field_cond,
+                    (conditioning_vec,),
+                    (conditioning_dot_vec,),
+                )
+                state_jvp = v_s_dot
 
-        pair_valid = self._kinematic_valid_mask(batch, data, conditioning_steps)
-        kinematic_loss_per_step = torch.mean(residual**2, dim=-1)
-        valid = pair_valid.to(dtype=kinematic_loss_per_step.dtype)
+                if self.config.use_jvp_ak:
+
+                    def flow_vector_field_action(actions: Tensor) -> Tensor:
+                        return model(actions, t, conditioning_vec=conditioning_vec)
+
+                    _, v_a_k_dot = torch.func.jvp(
+                        flow_vector_field_action,
+                        (x_t,),
+                        (a_dot_data,),
+                    )
+                    action_jvp = v_a_k_dot
+                    residual = v_s_dot + t.view(-1, 1, 1) * v_a_k_dot - a_dot_data
+                else:
+                    if self.config.use_1_k:
+                        v_s_dot = (1 - t.view(-1, 1, 1)) * v_s_dot
+                    residual = v_s_dot - a_dot_data
+
+        kinematic_valid = self._kinematic_valid_mask(batch, data, conditioning_steps)[:, horizon_slice]
+        kinematic_loss_per_step = torch.mean(residual[..., kinematic_action_mask] ** 2, dim=-1)
+        valid = kinematic_valid.to(dtype=kinematic_loss_per_step.dtype)
         num_valid = valid.sum()
         kinematic_loss = (kinematic_loss_per_step * valid).sum() / num_valid.clamp_min(1)
         kinematic_valid_ratio = valid.mean()
 
-        return predicted_velocity, kinematic_loss, kinematic_valid_ratio
+        # JVPs are vector-valued. Log their masked RMS magnitudes so the two
+        # kinematic terms are comparable as scalar WandB curves. Detaching here
+        # keeps observability from extending the training autograd graph.
+        def masked_jvp_rms(jvp: Tensor) -> Tensor:
+            squared_per_step = torch.mean(
+                jvp.detach()[..., kinematic_action_mask].float().square(),
+                dim=-1,
+            )
+            return torch.sqrt((squared_per_step * valid.float()).sum() / num_valid.float().clamp_min(1))
+
+        jvp_metrics = {}
+        if state_jvp is not None:
+            jvp_metrics["kinematic_state_jvp_rms"] = masked_jvp_rms(state_jvp)
+        if action_jvp is not None:
+            jvp_metrics["kinematic_action_jvp_rms"] = masked_jvp_rms(action_jvp)
+
+        return predicted_velocity, kinematic_loss, kinematic_valid_ratio, jvp_metrics
 
     def conditional_sample(self, model: nn.Module, batch_size: int, conditioning_vec: Tensor) -> Tensor:
         device = next(model.parameters()).device

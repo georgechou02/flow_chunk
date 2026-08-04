@@ -60,7 +60,11 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     lambda_flow_k: float = 0.0  # Weight for flow kinematic/JVP loss
     pre_train_steps: int = 0  # Number of initial optimization steps with lambda_flow_k forced to 0
     use_jvp_ak: bool = False  # Add action-input JVP term to kinematic loss
+    use_1_k: bool = False  # Scale the state JVP by (1 - flow time) when use_jvp_ak is disabled
+    gripper_first: bool = True  # Include the final gripper action dimension in kinematic/JVP loss
+    enable_stochastic: bool = False  # Compute kinematic JVP loss at one random horizon step
     sample_frequency: float = 10.0  # Dataset/control frequency in Hz for finite differences
+    dct_coe_num: int = 0  # Number of retained DCT modes for analytic action derivatives
 
     # Transformer Architecture
     hidden_dim: int = 512  # Transformer hidden dimension
@@ -83,6 +87,9 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     image_resize_shape: tuple[int, int] | None = None  # Resize images before crop
     image_crop_shape: tuple[int, int] | None = (224, 224)  # Crop shape (CLIP default)
     image_crop_is_random: bool = True  # Random crop during training, center at inference
+
+    # Language Conditioning
+    single_task: bool = False  # Disable language conditioning for single-task policies
 
     # Text Encoder (CLIP)
     text_encoder_name: str = "openai/clip-vit-base-patch16"  # HuggingFace CLIP model
@@ -171,7 +178,7 @@ class MultiTaskDiTConfig(PreTrainedConfig):
             self.image_crop_shape = None
 
         # Text encoder validation
-        if "clip" not in self.text_encoder_name.lower():
+        if not self.single_task and "clip" not in self.text_encoder_name.lower():
             raise ValueError(
                 f"text_encoder_name must be a CLIP model (contain 'clip'), got '{self.text_encoder_name}'"
             )
@@ -181,6 +188,10 @@ class MultiTaskDiTConfig(PreTrainedConfig):
             raise ValueError(f"pre_train_steps must be >= 0, got {self.pre_train_steps}")
         if self.sample_frequency <= 0:
             raise ValueError(f"sample_frequency must be > 0, got {self.sample_frequency}")
+        if not 0 <= self.dct_coe_num <= self.horizon:
+            raise ValueError(
+                f"dct_coe_num must be in [0, horizon] (got {self.dct_coe_num} for horizon={self.horizon})"
+            )
 
         # Objective-specific validation
         if self.objective == "diffusion":

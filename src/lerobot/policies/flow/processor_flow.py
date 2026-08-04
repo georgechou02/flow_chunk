@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
-# Copyright 2025 Bryson Jones and The HuggingFace Inc. team. All rights reserved.
+# Copyright 2024 Columbia Artificial Intelligence, Robotics Lab,
+# and The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +14,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from typing import Any
 
 import torch
@@ -25,81 +25,52 @@ from lerobot.processor import (
     PolicyAction,
     PolicyProcessorPipeline,
     RenameObservationsProcessorStep,
-    TokenizerProcessorStep,
     UnnormalizerProcessorStep,
     policy_action_to_transition,
     transition_to_policy_action,
 )
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
-from .configuration_multi_task_dit import MultiTaskDiTConfig
+from .configuration_flow import FlowConfig
 
 
-def make_multi_task_dit_pre_post_processors(
-    config: MultiTaskDiTConfig,
+def make_flow_pre_post_processors(
+    config: FlowConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
     """
-    Constructs pre-processor and post-processor pipelines for a Multi-Task DiT policy.
+    Constructs pre-processor and post-processor pipelines for a flow policy.
 
     The pre-processing pipeline prepares the input data for the model by:
     1. Renaming features.
-    2. Adding a batch dimension.
-    3. Tokenizing the language task description (if present).
+    2. Normalizing the input and output features based on dataset statistics.
+    3. Adding a batch dimension.
     4. Moving the data to the specified device.
-    5. Normalizing the input and output features based on dataset statistics.
 
     The post-processing pipeline handles the model's output by:
-    1. Unnormalizing the output features to their original scale.
-    2. Moving the data to the CPU.
-
-    Args:
-        config: The configuration object for the Multi-Task DiT policy,
-            containing feature definitions, normalization mappings, and device information.
-        dataset_stats: A dictionary of statistics used for normalization.
-            Defaults to None.
-
-    Returns:
-        A tuple containing the configured pre-processor and post-processor pipelines.
+    1. Moving the data to the CPU.
+    2. Unnormalizing the output features to their original scale.
     """
 
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
-    ]
-    if not config.single_task:
-        input_steps.append(
-            TokenizerProcessorStep(
-                tokenizer_name=config.text_encoder_name,
-                padding=config.tokenizer_padding,
-                padding_side=config.tokenizer_padding_side,
-                max_length=config.tokenizer_max_length,
-                truncation=config.tokenizer_truncation,
-            )
-        )
-    input_steps.extend(
-        [
-            DeviceProcessorStep(device=config.device),
-            NormalizerProcessorStep(
-                features={**config.input_features, **config.output_features},
-                norm_map=config.normalization_mapping,
-                stats=dataset_stats,
-                device=config.device,
-            ),
-        ]
-    )
-    output_steps = [
-        UnnormalizerProcessorStep(
-            features=config.output_features,
+        DeviceProcessorStep(device=config.device),
+        NormalizerProcessorStep(
+            features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),
+    ]
+    output_steps = [
+        UnnormalizerProcessorStep(
+            features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
+        ),
         DeviceProcessorStep(device="cpu"),
     ]
-
     return (
         PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
             steps=input_steps,
