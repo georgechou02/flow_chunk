@@ -37,7 +37,7 @@
   # # 两个独立单卡实验
   # GPUS='0,1' RUN_SEEDS='[1000,1001]' bash train_multitask_dit.sh
 
-  # GPUS='4' \
+  # GPUS='1' \
   # RUN_SEEDS='[1000]' \
   # BATCH_SIZE=64 \
   # STEPS=20000 \
@@ -45,8 +45,8 @@
   # POLICY_LAMBDA_FLOW_K='[0.01]' \
   # POLICY_USE_JVP_AK='[false]' \
   # POLICY_USE_1_K=false \
-  # POLICY_DCT_COE_NUM='[45]' \
-  # ENV_EVAL_FREQ=0 \
+  # POLICY_DCT_COE_NUM='[40]' \
+  # ENV_EVAL_FREQ=20000 \
   # bash train_multitask_dit.sh
 
 

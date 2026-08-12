@@ -65,6 +65,8 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     enable_stochastic: bool = False  # Compute kinematic JVP loss at one random horizon step
     sample_frequency: float = 10.0  # Dataset/control frequency in Hz for finite differences
     dct_coe_num: int = 0  # Number of retained DCT modes for analytic action derivatives
+    conditioning_derivative_mode: str = "reverse"  # "reverse", "forward", or "central"
+    image_only_condition_jvp: bool = False  # Keep only image features in the conditioning JVP tangent
 
     # Transformer Architecture
     hidden_dim: int = 512  # Transformer hidden dimension
@@ -192,6 +194,11 @@ class MultiTaskDiTConfig(PreTrainedConfig):
             raise ValueError(
                 f"dct_coe_num must be in [0, horizon] (got {self.dct_coe_num} for horizon={self.horizon})"
             )
+        if self.conditioning_derivative_mode not in {"reverse", "forward", "central"}:
+            raise ValueError(
+                "conditioning_derivative_mode must be 'reverse', 'forward', or 'central', "
+                f"got '{self.conditioning_derivative_mode}'"
+            )
 
         # Objective-specific validation
         if self.objective == "diffusion":
@@ -266,9 +273,11 @@ class MultiTaskDiTConfig(PreTrainedConfig):
             first_key, first_ft = next(iter(self.image_features.items()))
             for key, image_ft in self.image_features.items():
                 if image_ft.shape != first_ft.shape:
-                    raise ValueError(
-                        f"Image '{key}' shape {image_ft.shape} != '{first_key}' shape {first_ft.shape}"
-                    )
+                    if self.image_resize_shape is None or image_ft.shape[0] != first_ft.shape[0]:
+                        raise ValueError(
+                            f"Image '{key}' shape {image_ft.shape} != '{first_key}' shape {first_ft.shape}. "
+                            "Mixed image heights and widths require image_resize_shape, and channel counts must match."
+                        )
 
     @property
     def is_diffusion(self) -> bool:
@@ -280,7 +289,13 @@ class MultiTaskDiTConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> list:
-        return list(range(1 - self.n_obs_steps, 1))
+        indices = list(range(1 - self.n_obs_steps, 1))
+        if self.is_flow_matching and self.lambda_flow_k > 0:
+            if self.conditioning_derivative_mode in {"reverse", "central"}:
+                indices.insert(0, -self.n_obs_steps)
+            if self.conditioning_derivative_mode in {"forward", "central"}:
+                indices.append(1)
+        return indices
 
     @property
     def action_delta_indices(self) -> list:

@@ -130,6 +130,7 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
                 action_dim=action_dim,
                 horizon=horizon,
                 do_mask_loss_for_padding=config.do_mask_loss_for_padding,
+                image_feature_slice=self.observation_encoder.image_feature_slice,
             )
         else:
             raise ValueError(f"Unsupported objective: {config.objective}")
@@ -207,7 +208,21 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
         """Prepare batch by stacking image features if needed."""
         if self.config.image_features:
             batch = dict(batch)  # shallow copy to avoid modifying original
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+            camera_images = [batch[key] for key in self.config.image_features]
+            first_shape = camera_images[0].shape
+            if any(image.shape != first_shape for image in camera_images[1:]):
+                if not self.observation_encoder.do_resize:
+                    raise ValueError("Mixed-resolution camera inputs require image_resize_shape.")
+                resized_camera_images = []
+                for image in camera_images:
+                    leading_shape = image.shape[:-3]
+                    flattened_image = image.reshape(-1, *image.shape[-3:])
+                    resized_image = self.observation_encoder.resize(flattened_image)
+                    resized_camera_images.append(
+                        resized_image.reshape(*leading_shape, *resized_image.shape[-3:])
+                    )
+                camera_images = resized_camera_images
+            batch[OBS_IMAGES] = torch.stack(camera_images, dim=-4)
 
         return batch
 
@@ -233,7 +248,22 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
         """Run the batch through the model and compute the loss for training"""
         batch = self._prepare_batch(batch)
 
-        conditioning_steps = self.observation_encoder.encode_steps(batch)
+        derivative_conditioning_steps = self.observation_encoder.encode_steps(batch)
+        num_derivative_steps = derivative_conditioning_steps.shape[1]
+        if num_derivative_steps == self.config.n_obs_steps:
+            conditioning_start = 0
+        else:
+            mode = self.config.conditioning_derivative_mode
+            expected_steps = self.config.n_obs_steps + (2 if mode == "central" else 1)
+            if num_derivative_steps != expected_steps:
+                raise ValueError(
+                    f"{mode} conditioning differences require {expected_steps} observation steps, "
+                    f"got {num_derivative_steps}."
+                )
+            conditioning_start = 1 if mode in {"reverse", "central"} else 0
+        conditioning_steps = derivative_conditioning_steps[
+            :, conditioning_start : conditioning_start + self.config.n_obs_steps
+        ]
         conditioning_vec = conditioning_steps.flatten(start_dim=1)
 
         train_step = int(self._train_step.item()) if self.training else None
@@ -243,6 +273,7 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
                 batch,
                 conditioning_vec,
                 conditioning_steps=conditioning_steps,
+                derivative_conditioning_steps=derivative_conditioning_steps,
                 train_step=train_step,
             )
             self._maybe_increment_train_step()
@@ -437,10 +468,17 @@ class ObservationEncoder(nn.Module):
             )
 
         total_dim = self.robot_state_dim
+        image_feature_dim = 0
         if self.vision_encoder is not None or self.vision_encoders is not None:
             encoder_to_check = self.vision_encoder or next(iter(self.vision_encoders))
             c, h, w = encoder_to_check.get_output_shape()
-            total_dim += c * h * w * self.num_cameras
+            image_feature_dim = c * h * w * self.num_cameras
+            total_dim += image_feature_dim
+        self.image_feature_slice = (
+            slice(self.robot_state_dim, self.robot_state_dim + image_feature_dim)
+            if image_feature_dim > 0
+            else None
+        )
         if self.text_encoder is not None:
             total_dim += config.hidden_dim
         self.conditioning_dim = total_dim * config.n_obs_steps
@@ -848,12 +886,20 @@ class DiffusionObjective(nn.Module):
 class FlowMatchingObjective(nn.Module):
     """Flow matching objective: trains a model to predict velocity fields."""
 
-    def __init__(self, config, action_dim: int, horizon: int, do_mask_loss_for_padding: bool = False):
+    def __init__(
+        self,
+        config,
+        action_dim: int,
+        horizon: int,
+        do_mask_loss_for_padding: bool = False,
+        image_feature_slice: slice | None = None,
+    ):
         super().__init__()
         self.config = config
         self.action_dim = action_dim
         self.horizon = horizon
         self.do_mask_loss_for_padding = do_mask_loss_for_padding
+        self.image_feature_slice = image_feature_slice
         if not self.config.gripper_first and self.action_dim < 2:
             raise ValueError("gripper_first=False requires at least one non-gripper action dimension.")
 
@@ -881,6 +927,7 @@ class FlowMatchingObjective(nn.Module):
         conditioning_vec: Tensor,
         conditioning_steps: Tensor | None = None,
         train_step: int | None = None,
+        derivative_conditioning_steps: Tensor | None = None,
     ) -> tuple[Tensor, dict]:
         action_sequence = batch[ACTION]
         data = action_sequence[:, : self.horizon]
@@ -898,6 +945,10 @@ class FlowMatchingObjective(nn.Module):
         if use_kinematic_loss:
             if conditioning_steps is None:
                 raise ValueError("conditioning_steps is required when lambda_flow_k > 0.")
+            if derivative_conditioning_steps is None:
+                raise ValueError(
+                    "derivative_conditioning_steps is required when lambda_flow_k > 0."
+                )
             predicted_velocity, kinematic_loss, kinematic_valid_ratio, kinematic_jvp_metrics = (
                 self._compute_kinematic_loss(
                     model=model,
@@ -908,6 +959,7 @@ class FlowMatchingObjective(nn.Module):
                     t=t,
                     conditioning_vec=conditioning_vec,
                     conditioning_steps=conditioning_steps,
+                    derivative_conditioning_steps=derivative_conditioning_steps,
                 )
             )
         else:
@@ -1001,20 +1053,69 @@ class FlowMatchingObjective(nn.Module):
             mask[-1] = False
         return mask
 
-    def _conditioning_dot(self, conditioning_steps: Tensor, fps: Tensor) -> Tensor:
-        if conditioning_steps.shape[1] < 2:
+    def _conditioning_dot(
+        self,
+        conditioning_steps: Tensor,
+        fps: Tensor,
+        derivative_conditioning_steps: Tensor | None = None,
+    ) -> Tensor:
+        mode = getattr(self.config, "conditioning_derivative_mode", "reverse")
+        image_only = getattr(self.config, "image_only_condition_jvp", False)
+        if derivative_conditioning_steps is None:
+            raise ValueError(f"{mode} conditioning differences require the complete derivative stencil.")
+
+        num_conditioning_steps = conditioning_steps.shape[1]
+        expected_steps = num_conditioning_steps + (2 if mode == "central" else 1)
+        if derivative_conditioning_steps.shape[1] != expected_steps:
             raise ValueError(
-                "lambda_flow_k > 0 requires n_obs_steps >= 2 to compute conditioning finite differences."
+                f"{mode} conditioning differences for {num_conditioning_steps} policy observations "
+                f"require {expected_steps} derivative observations, got "
+                f"{derivative_conditioning_steps.shape[1]}."
             )
 
-        conditioning_fps = fps.reshape(fps.shape[0], 1) if fps.ndim > 0 else fps
-        conditioning_dot_steps = torch.zeros_like(conditioning_steps)
-        conditioning_dot_steps[:, -1] = (
-            conditioning_steps[:, -1] - conditioning_steps[:, -2]
-        ) * conditioning_fps
+        conditioning_start = 1 if mode in {"reverse", "central"} else 0
+        current_steps = derivative_conditioning_steps[
+            :, conditioning_start : conditioning_start + num_conditioning_steps
+        ]
+        conditioning_fps = fps.reshape(fps.shape[0], 1, 1) if fps.ndim > 0 else fps
+
+        if mode == "reverse":
+            previous_steps = derivative_conditioning_steps[
+                :, conditioning_start - 1 : conditioning_start + num_conditioning_steps - 1
+            ]
+            conditioning_dot_steps = (current_steps - previous_steps) * conditioning_fps
+        elif mode == "forward":
+            next_steps = derivative_conditioning_steps[
+                :, conditioning_start + 1 : conditioning_start + num_conditioning_steps + 1
+            ]
+            conditioning_dot_steps = (next_steps - current_steps) * conditioning_fps
+        elif mode == "central":
+            previous_steps = derivative_conditioning_steps[
+                :, conditioning_start - 1 : conditioning_start + num_conditioning_steps - 1
+            ]
+            next_steps = derivative_conditioning_steps[
+                :, conditioning_start + 1 : conditioning_start + num_conditioning_steps + 1
+            ]
+            conditioning_dot_steps = (next_steps - previous_steps) * (conditioning_fps * 0.5)
+        else:
+            raise ValueError(f"Unsupported conditioning derivative mode: {mode}")
+
+        if image_only:
+            if self.image_feature_slice is None:
+                raise ValueError("image_only_condition_jvp=True requires at least one image feature.")
+            image_mask = conditioning_dot_steps.new_zeros(conditioning_dot_steps.shape[-1])
+            image_mask[self.image_feature_slice] = 1
+            conditioning_dot_steps = conditioning_dot_steps * image_mask
+
         return conditioning_dot_steps.flatten(start_dim=1)
 
-    def _kinematic_valid_mask(self, batch: dict[str, Tensor], data: Tensor, conditioning_steps: Tensor) -> Tensor:
+    def _kinematic_valid_mask(
+        self,
+        batch: dict[str, Tensor],
+        data: Tensor,
+        conditioning_steps: Tensor,
+        derivative_conditioning_steps: Tensor | None = None,
+    ) -> Tensor:
         kinematic_valid = torch.ones(data.shape[:2], dtype=torch.bool, device=data.device)
 
         if "action_is_pad" in batch:
@@ -1026,14 +1127,16 @@ class FlowMatchingObjective(nn.Module):
 
         obs_pad_key = f"{OBS_STATE}_is_pad"
         if obs_pad_key in batch:
+            if derivative_conditioning_steps is None:
+                raise ValueError("Observation padding validation requires the complete derivative stencil.")
             obs_is_pad = batch[obs_pad_key].to(device=data.device, dtype=torch.bool)
-            if obs_is_pad.shape[:2] != conditioning_steps.shape[:2]:
+            if obs_is_pad.shape[:2] != derivative_conditioning_steps.shape[:2]:
                 raise ValueError(
                     f"{obs_pad_key} shape {tuple(obs_is_pad.shape)} does not match conditioning steps "
-                    f"{tuple(conditioning_steps.shape[:2])}"
+                    f"{tuple(derivative_conditioning_steps.shape[:2])}"
                 )
-            obs_pair_valid = ~obs_is_pad[:, -2] & ~obs_is_pad[:, -1]
-            kinematic_valid &= obs_pair_valid[:, None]
+            obs_valid = ~obs_is_pad.any(dim=1)
+            kinematic_valid &= obs_valid[:, None]
         # If no observation padding mask is present, validity is determined by action padding.
 
         return kinematic_valid
@@ -1048,12 +1151,17 @@ class FlowMatchingObjective(nn.Module):
         t: Tensor,
         conditioning_vec: Tensor,
         conditioning_steps: Tensor,
+        derivative_conditioning_steps: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, dict[str, Tensor]]:
         fps = self._sample_frequency(batch, data)
         kinematic_action_mask = self._kinematic_action_mask(data)
         a_dot_data = self._action_dot(action_sequence, fps)
         a_dot_data = a_dot_data * kinematic_action_mask.to(dtype=a_dot_data.dtype)
-        conditioning_dot_vec = self._conditioning_dot(conditioning_steps, fps)
+        conditioning_dot_vec = self._conditioning_dot(
+            conditioning_steps,
+            fps,
+            derivative_conditioning_steps=derivative_conditioning_steps,
+        )
         state_jvp = None
         action_jvp = None
         if self.config.enable_stochastic:
@@ -1118,7 +1226,12 @@ class FlowMatchingObjective(nn.Module):
                         v_s_dot = (1 - t.view(-1, 1, 1)) * v_s_dot
                     residual = v_s_dot - a_dot_data
 
-        kinematic_valid = self._kinematic_valid_mask(batch, data, conditioning_steps)[:, horizon_slice]
+        kinematic_valid = self._kinematic_valid_mask(
+            batch,
+            data,
+            conditioning_steps,
+            derivative_conditioning_steps=derivative_conditioning_steps,
+        )[:, horizon_slice]
         kinematic_loss_per_step = torch.mean(residual[..., kinematic_action_mask] ** 2, dim=-1)
         valid = kinematic_valid.to(dtype=kinematic_loss_per_step.dtype)
         num_valid = valid.sum()
