@@ -176,3 +176,6 @@ outputs/
 *.urdf
 *.xml
 *.part
+FAFM/*
+*.pdf
+*.json
