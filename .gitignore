@@ -166,26 +166,6 @@ wandb/
 data/
 outputs/
 
-# Local training/evaluation artifacts
-/train_*.sh
-/eval_*.sh
-*.mp4
-*.avi
-*.mov
-*.mkv
-*.webm
-/media/readme/*_video.webp
-*.out
-*.err
-*.pt
-*.pth
-*.ckpt
-*.safetensors
-*.hdf5
-*.h5
-*.bag
-*.wandb
-
 # Translations
 *.mo
 *.pot

@@ -24,7 +24,6 @@ fi
 
 ACCELERATE_BIN="${ACCELERATE_BIN:-/data/zhouzhi/conda_envs/lerobot/bin/accelerate}"
 LEROBOT_TRAIN_BIN="${LEROBOT_TRAIN_BIN:-/data/zhouzhi/conda_envs/lerobot/bin/lerobot-train}"
-LEROBOT_ENV_ROOT="${LEROBOT_ENV_ROOT:-/data/zhouzhi/conda_envs/lerobot}"
 
 GPU_IDS="${GPU_IDS:-0,1,2,3}"
 IFS=',' read -r -a GPU_ARRAY <<< "$GPU_IDS"
@@ -53,7 +52,7 @@ WANDB_PROJECT="${WANDB_PROJECT:-multitask_dit_real}"
 WANDB_MODE="${WANDB_MODE:-offline}"
 
 RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date '+%Y%m%d_%H%M%S')}"
-RUN_NAME="${RUN_NAME:-PutSausageInPot-num_traj${NUM_TRAJ_LABEL}-clip-${DERIVATIVE_MODE}-image_only_condition_jvp_${IMAGE_ONLY_CONDITION_JVP}-lambda${LAMBDA_FLOW_K}-seed${SEED}}"
+RUN_NAME="${RUN_NAME:-PutSausageInPot-num_traj${NUM_TRAJ_LABEL}-clip-${DERIVATIVE_MODE}-image_only_${IMAGE_ONLY_CONDITION_JVP}-lambda${LAMBDA_FLOW_K}-seed${SEED}}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/outputs/real_robot}"
 OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_NAME}_${RUN_TIMESTAMP}}"
 
@@ -62,7 +61,6 @@ export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
 export TMPDIR="${TMPDIR:-/data/zhouzhi/tmp}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${TMPDIR}/hf_datasets_cache_flow}"
 export NUMBA_CACHE_DIR="${NUMBA_CACHE_DIR:-${TMPDIR}/numba_cache}"
-export LD_LIBRARY_PATH="${LEROBOT_ENV_ROOT}/lib:${LEROBOT_ENV_ROOT}/lib/python3.12/site-packages/torch/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
 if [[ ! -x "$ACCELERATE_BIN" ]]; then
   echo "Missing accelerate executable: $ACCELERATE_BIN" >&2
@@ -198,6 +196,5 @@ CUDA_VISIBLE_DEVICES="$GPU_IDS" "${cmd[@]}"
 
 
 
-# NUM_TRAJ=30 LAMBDA_FLOW_K=0.01 IMAGE_ONLY_CONDITION_JVP=true bash pipeline/scripts/run_training.sh && \
-# NUM_TRAJ=30 LAMBDA_FLOW_K=0 IMAGE_ONLY_CONDITION_JVP=true bash pipeline/scripts/run_training.sh && \
-# NUM_TRAJ=30 LAMBDA_FLOW_K=0.01 IMAGE_ONLY_CONDITION_JVP=false bash pipeline/scripts/run_training.sh
+# NUM_TRAJ=30 LAMBDA_FLOW_K=0.01 bash pipeline/scripts/run_training.sh && \
+# NUM_TRAJ=30 LAMBDA_FLOW_K=0 bash pipeline/scripts/run_training.sh

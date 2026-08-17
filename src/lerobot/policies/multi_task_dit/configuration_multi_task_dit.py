@@ -60,11 +60,13 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     lambda_flow_k: float = 0.0  # Weight for flow kinematic/JVP loss
     pre_train_steps: int = 0  # Number of initial optimization steps with lambda_flow_k forced to 0
     use_jvp_ak: bool = False  # Add action-input JVP term to kinematic loss
+    # In the full-horizon JVP loss, keep the action-input JVP value but stop its kinematic gradient.
+    stop_gradient_jvp_ak: bool = False
     use_1_k: bool = False  # Scale the state JVP by (1 - flow time) when use_jvp_ak is disabled
     gripper_first: bool = True  # Include the final gripper action dimension in kinematic/JVP loss
     enable_stochastic: bool = False  # Compute kinematic JVP loss at one random horizon step
     sample_frequency: float = 10.0  # Dataset/control frequency in Hz for finite differences
-    dct_coe_num: int = 0  # Number of retained DCT modes for analytic action derivatives
+    dct_coe_num: int = 0  # Retained DCT modes; 0 uses H+2-point central differences
     conditioning_derivative_mode: str = "reverse"  # "reverse", "forward", or "central"
     image_only_condition_jvp: bool = False  # Keep only image features in the conditioning JVP tangent
 
@@ -299,7 +301,15 @@ class MultiTaskDiTConfig(PreTrainedConfig):
 
     @property
     def action_delta_indices(self) -> list:
-        return list(range(1 - self.n_obs_steps, 1 - self.n_obs_steps + self.horizon + 1))
+        # DCT differentiates exactly the H-point action chunk used by the flow model.
+        # Central differences require one neighboring action on each side of that chunk.
+        needs_central_difference_stencil = (
+            self.is_flow_matching and self.lambda_flow_k > 0 and self.dct_coe_num == 0
+        )
+        start = 1 - self.n_obs_steps
+        if needs_central_difference_stencil:
+            return list(range(start - 1, start + self.horizon + 1))
+        return list(range(start, start + self.horizon))
 
     @property
     def reward_delta_indices(self) -> None:

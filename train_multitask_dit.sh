@@ -54,6 +54,9 @@
   # - 四卡实验，NUM_WORKERS=24 → 总共 96 个
   # - 两个四卡实验，NUM_WORKERS=24 → 总共 192 个
 
+
+# 显存大是因为现在对两帧都求了jvp
+# 补两帧都加的结果
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -101,7 +104,7 @@ fi
 LIBERO_ROOT="${LIBERO_ROOT:-/home/zhouzhi/.cache/huggingface/lerobot/hub/datasets--HuggingFaceVLA--libero/snapshots/86958911c0f959db2bbbdb107eb3e17c5f9c798e}"
 
 # GPUS="${GPUS:-${GPU_IDS:-${GPU_ID:-${CUDA_VISIBLE_DEVICES:-0 1 2 3 4 5 6}}}}"
-GPUS="${GPUS:-${GPU_IDS:-${GPU_ID:-${CUDA_VISIBLE_DEVICES:-0 3 4}}}}"
+GPUS="${GPUS:-${GPU_IDS:-${GPU_ID:-${CUDA_VISIBLE_DEVICES:-0 1}}}}"
 
 STEPS="${STEPS:-20000}"
 PRE_TRAIN_STEPS="${PRE_TRAIN_STEPS:-${POLICY_PRE_TRAIN_STEPS:-0}}"
@@ -112,14 +115,17 @@ PRE_TRAIN_STEPS="${PRE_TRAIN_STEPS:-${POLICY_PRE_TRAIN_STEPS:-0}}"
 # POLICY_ENABLE_STOCHASTIC="${POLICY_ENABLE_STOCHASTIC:-false}"
 # POLICY_DCT_COE_NUM="${POLICY_DCT_COE_NUM:-0}"
 POLICY_LAMBDA_FLOW_K="${POLICY_LAMBDA_FLOW_K:-0.01}"
-POLICY_USE_JVP_AK="${POLICY_USE_JVP_AK:-false}"
-POLICY_USE_1_K="${POLICY_USE_1_K:-true}"
+POLICY_USE_JVP_AK="${POLICY_USE_JVP_AK:-True}"
+STOPGRAD_AK="${STOPGRAD_AK:-False}"
+POLICY_USE_1_K="${POLICY_USE_1_K:-false}"
 POLICY_ENABLE_STOCHASTIC="${POLICY_ENABLE_STOCHASTIC:-false}"
 POLICY_DCT_COE_NUM="${POLICY_DCT_COE_NUM:-48}"
+POLICY_CONDITIONING_DERIVATIVE_MODE="${POLICY_CONDITIONING_DERIVATIVE_MODE:-central}"
+POLICY_IMAGE_ONLY_CONDITION_JVP="${POLICY_IMAGE_ONLY_CONDITION_JVP:-false}"
 
-RUN_SEEDS="${RUN_SEEDS:-${SEEDS:-${SEED:-1000 1001 1002}}}"
+RUN_SEEDS="${RUN_SEEDS:-${SEEDS:-${SEED:-1000 1001}}}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
-NUM_WORKERS="${NUM_WORKERS:-24}"
+NUM_WORKERS="${NUM_WORKERS:-12}"
 # check point
 SAVE_FREQ="${SAVE_FREQ:-10000}"
 MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
@@ -134,7 +140,7 @@ EVAL_USE_ASYNC_ENVS="${EVAL_USE_ASYNC_ENVS:-true}"
 EVAL_OBSERVATION_HEIGHT="${EVAL_OBSERVATION_HEIGHT:-256}"
 EVAL_OBSERVATION_WIDTH="${EVAL_OBSERVATION_WIDTH:-256}"
 
-RUN_PREFIX="${RUN_PREFIX:-multitask-dit-flow-libero-lambda-ak-step20000}"
+RUN_PREFIX="${RUN_PREFIX:-multitask-dit-flow-libero-1-ksqr-sg-dropputfixed-centraldiffboths_a-step20000}"
 # RUN_PREFIX="${RUN_PREFIX:-multitask-dit-flow-libero-baseline}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs}"
 RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date '+%Y%m%d_%H%M%S')}"
@@ -198,14 +204,14 @@ for value in values:
         print(text)
     elif kind == "dct_coe_num":
         print(value)
-    elif kind == "use_jvp_ak":
+    elif kind in {"use_jvp_ak", "stopgrad_ak", "image_only_condition_jvp"}:
         text = str(value).strip().lower()
         if text in {"1", "true", "yes", "y", "on"}:
             print("true")
         elif text in {"0", "false", "no", "n", "off"}:
             print("false")
         else:
-            raise SystemExit(f"use_jvp_ak must be true or false, got {value!r}")
+            raise SystemExit(f"{kind} must be true or false, got {value!r}")
     else:
         text = str(value).strip()
         if not text:
@@ -233,8 +239,10 @@ require_non_negative_int() {
 run_group_for() {
   local lambda_flow_k="$1"
   local use_jvp_ak="$2"
-  local dct_coe_num="$3"
-  echo "${RUN_PREFIX}_kinematic_$(safe_tag "$lambda_flow_k")_use_ak_$(safe_tag "$use_jvp_ak")_use_1_k_$(safe_tag "$POLICY_USE_1_K")_stochastic_$(safe_tag "$POLICY_ENABLE_STOCHASTIC")_dct_$(safe_tag "$dct_coe_num")_batch_size${BATCH_SIZE}_steps${STEPS}_pre_train_steps${PRE_TRAIN_STEPS}"
+  local stopgrad_ak="$3"
+  local image_only_condition_jvp="$4"
+  local dct_coe_num="$5"
+  echo "${RUN_PREFIX}_kinematic_$(safe_tag "$lambda_flow_k")_use_ak_$(safe_tag "$use_jvp_ak")_stopgrad_ak_$(safe_tag "$stopgrad_ak")_use_1_k_$(safe_tag "$POLICY_USE_1_K")_tangent_$(safe_tag "$POLICY_CONDITIONING_DERIVATIVE_MODE")_image_only_jvp_$(safe_tag "$image_only_condition_jvp")_stochastic_$(safe_tag "$POLICY_ENABLE_STOCHASTIC")_dct_$(safe_tag "$dct_coe_num")_batch_size${BATCH_SIZE}_steps${STEPS}_pre_train_steps${PRE_TRAIN_STEPS}"
 }
 
 run_path_for() {
@@ -242,8 +250,10 @@ run_path_for() {
   local seed="$2"
   local lambda_flow_k="$3"
   local use_jvp_ak="$4"
-  local dct_coe_num="$5"
-  echo "${OUTPUT_ROOT%/}/${kind}/$(run_group_for "$lambda_flow_k" "$use_jvp_ak" "$dct_coe_num")_${RUN_TIMESTAMP}/seed${seed}"
+  local stopgrad_ak="$5"
+  local image_only_condition_jvp="$6"
+  local dct_coe_num="$7"
+  echo "${OUTPUT_ROOT%/}/${kind}/$(run_group_for "$lambda_flow_k" "$use_jvp_ak" "$stopgrad_ak" "$image_only_condition_jvp" "$dct_coe_num")_${RUN_TIMESTAMP}/seed${seed}"
 }
 
 run_one() {
@@ -251,7 +261,9 @@ run_one() {
   local gpu_group="$2"
   local lambda_flow_k="$3"
   local use_jvp_ak="$4"
-  local dct_coe_num="$5"
+  local stopgrad_ak="$5"
+  local image_only_condition_jvp="$6"
+  local dct_coe_num="$7"
   local -a group_gpus
   local num_processes
   local out
@@ -265,15 +277,15 @@ run_one() {
   IFS=',' read -r -a group_gpus <<< "$gpu_group"
   num_processes="${#group_gpus[@]}"
 
-  out="$(run_path_for train "$seed" "$lambda_flow_k" "$use_jvp_ak" "$dct_coe_num")"
-  eval_out="$(run_path_for eval "$seed" "$lambda_flow_k" "$use_jvp_ak" "$dct_coe_num")"
-  run_group="$(run_group_for "$lambda_flow_k" "$use_jvp_ak" "$dct_coe_num")"
+  out="$(run_path_for train "$seed" "$lambda_flow_k" "$use_jvp_ak" "$stopgrad_ak" "$image_only_condition_jvp" "$dct_coe_num")"
+  eval_out="$(run_path_for eval "$seed" "$lambda_flow_k" "$use_jvp_ak" "$stopgrad_ak" "$image_only_condition_jvp" "$dct_coe_num")"
+  run_group="$(run_group_for "$lambda_flow_k" "$use_jvp_ak" "$stopgrad_ak" "$image_only_condition_jvp" "$dct_coe_num")"
   job_name="${run_group}_seed${seed}"
   wandb_group="${WANDB_GROUP:-$run_group}"
   wandb_notes="${WANDB_NOTES:-LOG_DIR:${wandb_group}}"
   wandb_tags="${WANDB_TAGS:-[\"LOG_DIR:$(safe_tag "$wandb_group")\"]}"
 
-  echo "seed=${seed} gpu=${gpu_group} num_processes=${num_processes} eval_suites=${EVAL_SUITES} lambda_flow_k=${lambda_flow_k} use_jvp_ak=${use_jvp_ak} use_1_k=${POLICY_USE_1_K} enable_stochastic=${POLICY_ENABLE_STOCHASTIC} dct_coe_num=${dct_coe_num} pre_train_steps=${PRE_TRAIN_STEPS} out=${out} eval_out=${eval_out} wandb_group=${wandb_group}"
+  echo "seed=${seed} gpu=${gpu_group} num_processes=${num_processes} eval_suites=${EVAL_SUITES} lambda_flow_k=${lambda_flow_k} use_jvp_ak=${use_jvp_ak} stopgrad_ak=${stopgrad_ak} use_1_k=${POLICY_USE_1_K} tangent=${POLICY_CONDITIONING_DERIVATIVE_MODE} image_only_condition_jvp=${image_only_condition_jvp} enable_stochastic=${POLICY_ENABLE_STOCHASTIC} dct_coe_num=${dct_coe_num} pre_train_steps=${PRE_TRAIN_STEPS} out=${out} eval_out=${eval_out} wandb_group=${wandb_group}"
 
   if [[ -d "$out" && "$RESUME" != "true" && "${DRY_RUN:-0}" != "1" ]]; then
     echo "Output directory already exists: ${out}" >&2
@@ -337,7 +349,10 @@ run_one() {
     --policy.lambda_flow_k="${lambda_flow_k}"
     --policy.pre_train_steps="${PRE_TRAIN_STEPS}"
     --policy.use_jvp_ak="${use_jvp_ak}"
+    --policy.stop_gradient_jvp_ak="${stopgrad_ak}"
     --policy.use_1_k="${POLICY_USE_1_K}"
+    --policy.conditioning_derivative_mode="${POLICY_CONDITIONING_DERIVATIVE_MODE}"
+    --policy.image_only_condition_jvp="${image_only_condition_jvp}"
     --policy.gripper_first=false
     --policy.enable_stochastic="${POLICY_ENABLE_STOCHASTIC}"
     --policy.sample_frequency=10.0
@@ -395,14 +410,24 @@ require_non_negative_int EVAL_BATCH_SIZE
 require_non_negative_int EVAL_OBSERVATION_HEIGHT
 require_non_negative_int EVAL_OBSERVATION_WIDTH
 
+case "$POLICY_CONDITIONING_DERIVATIVE_MODE" in
+  reverse|forward|central) ;;
+  *)
+    echo "POLICY_CONDITIONING_DERIVATIVE_MODE must be reverse, forward, or central; got '${POLICY_CONDITIONING_DERIVATIVE_MODE}'." >&2
+    exit 1
+    ;;
+esac
+
 mapfile -t SEEDS_ARRAY < <(parse_list "$RUN_SEEDS" seed)
 mapfile -t GPUS_ARRAY < <(parse_list "$GPUS" gpu)
 mapfile -t LAMBDAS < <(parse_list "$POLICY_LAMBDA_FLOW_K" lambda_flow_k)
 mapfile -t USE_JVP_AKS < <(parse_list "$POLICY_USE_JVP_AK" use_jvp_ak)
+mapfile -t STOPGRAD_AKS < <(parse_list "$STOPGRAD_AK" stopgrad_ak)
+mapfile -t IMAGE_ONLY_CONDITION_JVPS < <(parse_list "$POLICY_IMAGE_ONLY_CONDITION_JVP" image_only_condition_jvp)
 mapfile -t DCT_COE_NUMS < <(parse_list "$POLICY_DCT_COE_NUM" dct_coe_num)
 
-if (( ${#SEEDS_ARRAY[@]} == 0 || ${#GPUS_ARRAY[@]} == 0 || ${#LAMBDAS[@]} == 0 || ${#USE_JVP_AKS[@]} == 0 || ${#DCT_COE_NUMS[@]} == 0 )); then
-  echo "Empty seed/GPU/lambda/use_jvp_ak/dct_coe_num list." >&2
+if (( ${#SEEDS_ARRAY[@]} == 0 || ${#GPUS_ARRAY[@]} == 0 || ${#LAMBDAS[@]} == 0 || ${#USE_JVP_AKS[@]} == 0 || ${#STOPGRAD_AKS[@]} == 0 || ${#IMAGE_ONLY_CONDITION_JVPS[@]} == 0 || ${#DCT_COE_NUMS[@]} == 0 )); then
+  echo "Empty seed/GPU/lambda/use_jvp_ak/stopgrad_ak/image_only_condition_jvp/dct_coe_num list." >&2
   exit 1
 fi
 
@@ -410,8 +435,12 @@ RUNS=()
 for seed in "${SEEDS_ARRAY[@]}"; do
   for lambda_flow_k in "${LAMBDAS[@]}"; do
     for use_jvp_ak in "${USE_JVP_AKS[@]}"; do
-      for dct_coe_num in "${DCT_COE_NUMS[@]}"; do
-        RUNS+=("${seed}|${lambda_flow_k}|${use_jvp_ak}|${dct_coe_num}")
+      for stopgrad_ak in "${STOPGRAD_AKS[@]}"; do
+        for image_only_condition_jvp in "${IMAGE_ONLY_CONDITION_JVPS[@]}"; do
+          for dct_coe_num in "${DCT_COE_NUMS[@]}"; do
+            RUNS+=("${seed}|${lambda_flow_k}|${use_jvp_ak}|${stopgrad_ak}|${image_only_condition_jvp}|${dct_coe_num}")
+          done
+        done
       done
     done
   done
@@ -431,7 +460,10 @@ echo "eval_episodes=${EVAL_EPISODES}"
 echo "eval_batch_size=${EVAL_BATCH_SIZE}"
 echo "lambda_flow_k=${LAMBDAS[*]}"
 echo "use_jvp_ak=${USE_JVP_AKS[*]}"
+echo "stopgrad_ak=${STOPGRAD_AKS[*]}"
 echo "use_1_k=${POLICY_USE_1_K}"
+echo "conditioning_derivative_mode=${POLICY_CONDITIONING_DERIVATIVE_MODE}"
+echo "image_only_condition_jvp=${IMAGE_ONLY_CONDITION_JVPS[*]}"
 echo "enable_stochastic=${POLICY_ENABLE_STOCHASTIC}"
 echo "dct_coe_num=${DCT_COE_NUMS[*]}"
 echo "output_root=${OUTPUT_ROOT}"
@@ -451,14 +483,14 @@ for ((start = 0; start < NUM_RUNS; start += NUM_GPU_GROUPS)); do
       break
     fi
 
-    IFS='|' read -r seed lambda_flow_k use_jvp_ak dct_coe_num <<< "${RUNS[$run_idx]}"
+    IFS='|' read -r seed lambda_flow_k use_jvp_ak stopgrad_ak image_only_condition_jvp dct_coe_num <<< "${RUNS[$run_idx]}"
     gpu_group="${GPUS_ARRAY[$gpu_group_idx]}"
-    log_file="$(run_path_for train_logs "$seed" "$lambda_flow_k" "$use_jvp_ak" "$dct_coe_num").log"
-    label="seed ${seed}, lambda_flow_k ${lambda_flow_k}, use_jvp_ak ${use_jvp_ak}, dct_coe_num ${dct_coe_num}, gpus ${gpu_group}"
+    log_file="$(run_path_for train_logs "$seed" "$lambda_flow_k" "$use_jvp_ak" "$stopgrad_ak" "$image_only_condition_jvp" "$dct_coe_num").log"
+    label="seed ${seed}, lambda_flow_k ${lambda_flow_k}, use_jvp_ak ${use_jvp_ak}, stopgrad_ak ${stopgrad_ak}, image_only_condition_jvp ${image_only_condition_jvp}, dct_coe_num ${dct_coe_num}, gpus ${gpu_group}"
 
     mkdir -p "$(dirname "$log_file")"
     echo "launch ${label}; log=${log_file}"
-    (run_one "$seed" "$gpu_group" "$lambda_flow_k" "$use_jvp_ak" "$dct_coe_num") >"$log_file" 2>&1 &
+    (run_one "$seed" "$gpu_group" "$lambda_flow_k" "$use_jvp_ak" "$stopgrad_ak" "$image_only_condition_jvp" "$dct_coe_num") >"$log_file" 2>&1 &
     pids+=("$!")
     labels+=("$label")
     logs+=("$log_file")

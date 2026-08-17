@@ -834,6 +834,16 @@ class DiffusionObjective(nn.Module):
 
     def compute_loss(self, model: nn.Module, batch: dict[str, Tensor], conditioning_vec: Tensor) -> Tensor:
         clean_actions = batch[ACTION]
+        expected_action_shape = (clean_actions.shape[0], self.horizon, self.action_dim)
+        if clean_actions.shape != expected_action_shape:
+            raise ValueError(
+                f"Diffusion actions must have shape {expected_action_shape}, got {tuple(clean_actions.shape)}"
+            )
+        if "action_is_pad" in batch and batch["action_is_pad"].shape != expected_action_shape[:2]:
+            raise ValueError(
+                f"action_is_pad must have shape {expected_action_shape[:2]}, "
+                f"got {tuple(batch['action_is_pad'].shape)}"
+            )
         noise = torch.randn_like(clean_actions)
         timesteps = torch.randint(
             low=0,
@@ -930,7 +940,29 @@ class FlowMatchingObjective(nn.Module):
         derivative_conditioning_steps: Tensor | None = None,
     ) -> tuple[Tensor, dict]:
         action_sequence = batch[ACTION]
-        data = action_sequence[:, : self.horizon]
+        uses_central_action_stencil = (
+            self.config.lambda_flow_k > 0 and self.config.dct_coe_num == 0
+        )
+        expected_action_frames = self.horizon + 2 * int(uses_central_action_stencil)
+        expected_action_shape = (action_sequence.shape[0], expected_action_frames, self.action_dim)
+        if action_sequence.shape != expected_action_shape:
+            raise ValueError(
+                f"Flow-matching actions must have shape {expected_action_shape} for "
+                f"lambda_flow_k={self.config.lambda_flow_k} and "
+                f"dct_coe_num={self.config.dct_coe_num}, got {tuple(action_sequence.shape)}"
+            )
+        if "action_is_pad" in batch:
+            expected_pad_shape = expected_action_shape[:2]
+            if batch["action_is_pad"].shape != expected_pad_shape:
+                raise ValueError(
+                    f"action_is_pad must have shape {expected_pad_shape}, "
+                    f"got {tuple(batch['action_is_pad'].shape)}"
+                )
+        # With finite differences the dataset contains one neighbor on each side
+        # of the clean H-step action chunk.  Keep the flow target anchored to the
+        # same H physical action frames used by every other objective branch.
+        data_start = int(uses_central_action_stencil)
+        data = action_sequence[:, data_start : data_start + self.horizon]
         batch_size = data.shape[0]
         device = data.device
 
@@ -968,7 +1000,16 @@ class FlowMatchingObjective(nn.Module):
             kinematic_valid_ratio = data.new_zeros(())
             kinematic_jvp_metrics = {}
 
-        flow_loss = self._flow_loss(predicted_velocity, target_velocity, batch)
+        flow_action_is_pad = None
+        if "action_is_pad" in batch:
+            flow_action_is_pad = batch["action_is_pad"][
+                :, data_start : data_start + self.horizon
+            ]
+        flow_loss = self._flow_loss(
+            predicted_velocity,
+            target_velocity,
+            action_is_pad=flow_action_is_pad,
+        )
         total_loss = flow_loss + effective_lambda_flow_k * kinematic_loss
 
         output_dict = {
@@ -979,6 +1020,7 @@ class FlowMatchingObjective(nn.Module):
             "pre_train_steps": int(self.config.pre_train_steps),
             "train_step": int(train_step) if train_step is not None else -1,
             "use_jvp_ak": float(self.config.use_jvp_ak),
+            "stop_gradient_jvp_ak": float(self.config.stop_gradient_jvp_ak),
             "use_1_k": float(self.config.use_1_k),
             "gripper_first": float(self.config.gripper_first),
             "enable_stochastic": float(self.config.enable_stochastic),
@@ -990,11 +1032,22 @@ class FlowMatchingObjective(nn.Module):
         )
         return total_loss, output_dict
 
-    def _flow_loss(self, predicted_velocity: Tensor, target_velocity: Tensor, batch: dict[str, Tensor]) -> Tensor:
+    def _flow_loss(
+        self,
+        predicted_velocity: Tensor,
+        target_velocity: Tensor,
+        action_is_pad: Tensor | None = None,
+    ) -> Tensor:
         loss = F.mse_loss(predicted_velocity, target_velocity, reduction="none")
 
-        if self.do_mask_loss_for_padding and "action_is_pad" in batch:
-            mask = ~batch["action_is_pad"][:, : loss.shape[1]].to(device=loss.device, dtype=torch.bool).unsqueeze(-1)
+        if self.do_mask_loss_for_padding and action_is_pad is not None:
+            expected_shape = loss.shape[:2]
+            if action_is_pad.shape != expected_shape:
+                raise ValueError(
+                    f"Flow action_is_pad must have shape {expected_shape}, "
+                    f"got {tuple(action_is_pad.shape)}"
+                )
+            mask = ~action_is_pad.to(device=loss.device, dtype=torch.bool).unsqueeze(-1)
             num_valid = mask.sum() * loss.shape[-1]
             return (loss * mask).sum() / num_valid.clamp_min(1)
 
@@ -1018,12 +1071,21 @@ class FlowMatchingObjective(nn.Module):
 
     def _action_dot(self, action_sequence: Tensor, fps: Tensor) -> Tensor:
         if self.config.dct_coe_num == 0:
-            return (action_sequence[:, 1 : self.horizon + 1] - action_sequence[:, : self.horizon]) * fps
+            expected_frames = self.horizon + 2
+            if action_sequence.shape[1] != expected_frames:
+                raise ValueError(
+                    "Central-difference action derivative requires exactly horizon + 2 "
+                    f"({expected_frames}) action frames, got {action_sequence.shape[1]}"
+                )
+            return (
+                action_sequence[:, 2 : self.horizon + 2]
+                - action_sequence[:, : self.horizon]
+            ) * (fps * 0.5)
 
         num_samples = self.horizon
-        if action_sequence.shape[1] < num_samples:
+        if action_sequence.shape[1] != num_samples:
             raise ValueError(
-                f"DCT action derivative requires at least horizon ({num_samples}) action frames, "
+                f"DCT action derivative requires exactly horizon ({num_samples}) action frames, "
                 f"got {action_sequence.shape[1]}"
             )
 
@@ -1031,7 +1093,7 @@ class FlowMatchingObjective(nn.Module):
         input_dtype = action_sequence.dtype
         compute_dtype = torch.float32 if input_dtype in {torch.float16, torch.bfloat16} else input_dtype
         with _disabled_autocast_context(action_sequence.device):
-            actions = action_sequence[:, :num_samples].to(dtype=compute_dtype)
+            actions = action_sequence.to(dtype=compute_dtype)
             modes = torch.arange(num_modes, device=actions.device, dtype=compute_dtype)
             sample_points = torch.arange(num_samples, device=actions.device, dtype=compute_dtype) + 0.5
             alpha = torch.full_like(modes, math.sqrt(2.0 / num_samples))
@@ -1120,9 +1182,19 @@ class FlowMatchingObjective(nn.Module):
 
         if "action_is_pad" in batch:
             action_is_pad = batch["action_is_pad"].to(device=data.device, dtype=torch.bool)
-            action_valid = ~action_is_pad[:, : data.shape[1]]
+            expected_frames = self.horizon + 2 * int(self.config.dct_coe_num == 0)
+            expected_shape = (data.shape[0], expected_frames)
+            if action_is_pad.shape != expected_shape:
+                raise ValueError(
+                    f"action_is_pad must have shape {expected_shape} for "
+                    f"dct_coe_num={self.config.dct_coe_num}, got {tuple(action_is_pad.shape)}"
+                )
             if self.config.dct_coe_num == 0:
-                action_valid &= ~action_is_pad[:, 1 : data.shape[1] + 1]
+                action_valid = ~action_is_pad[:, 1 : data.shape[1] + 1]
+                action_valid &= ~action_is_pad[:, : data.shape[1]]
+                action_valid &= ~action_is_pad[:, 2 : data.shape[1] + 2]
+            else:
+                action_valid = ~action_is_pad[:, : data.shape[1]]
             kinematic_valid &= action_valid
 
         obs_pad_key = f"{OBS_STATE}_is_pad"
@@ -1201,12 +1273,27 @@ class FlowMatchingObjective(nn.Module):
                     if self.config.use_1_k:
                         kinematic_dot = (1 - t.view(-1, 1, 1)) * kinematic_dot
                 residual = kinematic_dot - a_dot_data[:, horizon_slice]
+                if self.config.use_jvp_ak:
+                    residual = (1 - t.view(-1, 1, 1)) * residual
             else:
-                predicted_velocity, v_s_dot = torch.func.jvp(
-                    flow_vector_field_cond,
-                    (conditioning_vec,),
-                    (conditioning_dot_vec,),
+                # The conditioning and action JVPs below are two evaluations of the
+                # same vector field.  Replay the first evaluation's RNG realization
+                # for the second one so training-time dropout does not turn their sum
+                # into derivatives of two different stochastic functions.  Wrapping
+                # only the first call restores the incoming RNG state before the
+                # action JVP; the second call then advances it exactly once.
+                jvp_rng_devices = [] if x_t.device.type == "cpu" else [x_t.device]
+                jvp_rng_context = (
+                    torch.random.fork_rng(devices=jvp_rng_devices, device_type=x_t.device.type)
+                    if self.config.use_jvp_ak
+                    else nullcontext()
                 )
+                with jvp_rng_context:
+                    predicted_velocity, v_s_dot = torch.func.jvp(
+                        flow_vector_field_cond,
+                        (conditioning_vec,),
+                        (conditioning_dot_vec,),
+                    )
                 state_jvp = v_s_dot
 
                 if self.config.use_jvp_ak:
@@ -1220,7 +1307,12 @@ class FlowMatchingObjective(nn.Module):
                         (a_dot_data,),
                     )
                     action_jvp = v_a_k_dot
-                    residual = v_s_dot + t.view(-1, 1, 1) * v_a_k_dot - a_dot_data
+                    v_a_k_dot_for_loss = (
+                        v_a_k_dot.detach() if self.config.stop_gradient_jvp_ak else v_a_k_dot
+                    )
+                    residual = (1 - t.view(-1, 1, 1)) * (
+                        v_s_dot + t.view(-1, 1, 1) * v_a_k_dot_for_loss - a_dot_data
+                    )
                 else:
                     if self.config.use_1_k:
                         v_s_dot = (1 - t.view(-1, 1, 1)) * v_s_dot
