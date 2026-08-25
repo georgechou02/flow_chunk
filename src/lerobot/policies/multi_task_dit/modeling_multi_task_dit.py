@@ -28,6 +28,7 @@ References:
 import math
 from collections import deque
 from contextlib import nullcontext
+from numbers import Integral
 from typing import TYPE_CHECKING
 
 import einops
@@ -90,6 +91,107 @@ def _disabled_autocast_context(device: torch.device):
     if device.type in {"cuda", "cpu", "xpu", "hpu", "mps"}:
         return torch.autocast(device_type=device.type, enabled=False)
     return nullcontext()
+
+
+def _parameter_averaged_bspline_knots(
+    degree: int,
+    coefficient_count: int,
+    *,
+    dtype: torch.dtype = torch.float64,
+    device: torch.device | None = None,
+) -> Tensor:
+    """Build clamped knots by averaging an M-point uniform pseudo-grid.
+
+    With ``u_i = i / (M - 1)``, the interior knots are
+    ``xi[p+j] = mean(u_j, ..., u_{j+p-1})`` for ``j=1,...,M-p-1``.
+    """
+    if degree < 1 or coefficient_count <= degree:
+        raise ValueError(
+            "B-spline knots require degree >= 1 and coefficient_count > degree, "
+            f"got p={degree}, M={coefficient_count}"
+        )
+    pseudo_grid = torch.linspace(0.0, 1.0, coefficient_count, dtype=dtype, device=device)
+    internal_values = [
+        pseudo_grid[index : index + degree].mean()
+        for index in range(1, coefficient_count - degree)
+    ]
+    internal = (
+        torch.stack(internal_values)
+        if internal_values
+        else torch.empty(0, dtype=dtype, device=device)
+    )
+    endpoints = torch.zeros(degree + 1, dtype=dtype, device=device)
+    return torch.cat((endpoints, internal, torch.ones_like(endpoints)))
+
+
+def _bspline_basis_matrix(query: Tensor, knots: Tensor, degree: int) -> Tensor:
+    """Evaluate every B-spline basis function with the Cox--de Boor recursion."""
+    if degree < 0:
+        raise ValueError(f"B-spline degree must be non-negative, got {degree}")
+    query = query.reshape(-1).to(device=knots.device, dtype=knots.dtype)
+    basis = ((query[:, None] >= knots[:-1]) & (query[:, None] < knots[1:])).to(knots.dtype)
+
+    # The half-open degree-zero definition needs an explicit closed right endpoint.
+    endpoint_rows = query == knots[-1]
+    if torch.any(endpoint_rows):
+        positive_final_spans = torch.nonzero(
+            (knots[:-1] < knots[-1]) & (knots[1:] == knots[-1]), as_tuple=False
+        ).flatten()
+        if not len(positive_final_spans):
+            raise ValueError("B-spline knot vector has no positive-width final span")
+        endpoint_basis = torch.zeros_like(basis)
+        endpoint_basis[:, positive_final_spans[-1]] = 1
+        basis = torch.where(endpoint_rows[:, None], endpoint_basis, basis)
+
+    for order in range(1, degree + 1):
+        num_basis = len(knots) - order - 1
+        left_denominator = knots[order : order + num_basis] - knots[:num_basis]
+        right_denominator = knots[order + 1 : order + num_basis + 1] - knots[1 : num_basis + 1]
+        left_nonzero = left_denominator != 0
+        right_nonzero = right_denominator != 0
+        safe_left = torch.where(left_nonzero, left_denominator, torch.ones_like(left_denominator))
+        safe_right = torch.where(right_nonzero, right_denominator, torch.ones_like(right_denominator))
+        left_weight = (query[:, None] - knots[:num_basis]) / safe_left
+        right_weight = (knots[order + 1 : order + num_basis + 1] - query[:, None]) / safe_right
+        basis = (
+            left_weight * basis[:, :num_basis] * left_nonzero
+            + right_weight * basis[:, 1 : num_basis + 1] * right_nonzero
+        )
+    return basis
+
+
+def _bspline_design_and_derivative(
+    horizon: int,
+    degree: int,
+    coefficient_count: int,
+) -> tuple[Tensor, Tensor]:
+    """Return sample design and analytic d/du basis matrices in float64."""
+    knots = _parameter_averaged_bspline_knots(degree, coefficient_count)
+    sample_u = torch.linspace(0.0, 1.0, horizon, dtype=torch.float64)
+    design = _bspline_basis_matrix(sample_u, knots, degree)
+    lower_basis = _bspline_basis_matrix(sample_u, knots, degree - 1)
+
+    left_denominator = knots[degree : degree + coefficient_count] - knots[:coefficient_count]
+    right_denominator = (
+        knots[degree + 1 : degree + coefficient_count + 1] - knots[1 : coefficient_count + 1]
+    )
+    left_scale = torch.where(
+        left_denominator != 0,
+        degree / torch.where(left_denominator != 0, left_denominator, torch.ones_like(left_denominator)),
+        torch.zeros_like(left_denominator),
+    )
+    right_scale = torch.where(
+        right_denominator != 0,
+        degree / torch.where(
+            right_denominator != 0, right_denominator, torch.ones_like(right_denominator)
+        ),
+        torch.zeros_like(right_denominator),
+    )
+    derivative = (
+        lower_basis[:, :coefficient_count] * left_scale
+        - lower_basis[:, 1 : coefficient_count + 1] * right_scale
+    )
+    return design, derivative
 
 
 # -- Policy --
@@ -910,8 +1012,95 @@ class FlowMatchingObjective(nn.Module):
         self.horizon = horizon
         self.do_mask_loss_for_padding = do_mask_loss_for_padding
         self.image_feature_slice = image_feature_slice
+        self.interpolation_mode = getattr(config, "interpolation_mode", "dct").lower()
+        if self.interpolation_mode not in {"dct", "bspline"}:
+            raise ValueError(
+                "interpolation_mode must be 'dct' or 'bspline', "
+                f"got '{self.interpolation_mode}'"
+            )
+        self._bspline_matrix_cache: dict[
+            tuple[torch.device, torch.dtype], tuple[Tensor, Tensor]
+        ] = {}
+        self._bspline_analysis_cpu: Tensor | None = None
+        self._bspline_derivative_basis_cpu: Tensor | None = None
+        if self.interpolation_mode == "bspline":
+            degree = getattr(config, "bspline_degree", 0)
+            coefficient_count = getattr(config, "bspline_coe_num", 0)
+            if (
+                isinstance(degree, bool)
+                or not isinstance(degree, Integral)
+                or isinstance(coefficient_count, bool)
+                or not isinstance(coefficient_count, Integral)
+            ):
+                raise ValueError("bspline_degree (p) and bspline_coe_num (M) must be integers")
+            degree = int(degree)
+            coefficient_count = int(coefficient_count)
+            if not 2 <= degree < coefficient_count <= horizon:
+                raise ValueError(
+                    "bspline mode requires 2 <= bspline_degree < bspline_coe_num <= horizon "
+                    f"(got p={degree}, M={coefficient_count}, horizon={horizon})"
+                )
+            design, derivative_basis = _bspline_design_and_derivative(
+                horizon,
+                degree,
+                coefficient_count,
+            )
+            pinv_rtol = 1e-13
+            singular_values = torch.linalg.svdvals(design)
+            effective_rank = int(
+                torch.count_nonzero(singular_values > singular_values[0] * pinv_rtol).item()
+            )
+            if effective_rank != coefficient_count:
+                raise ValueError(
+                    "B-spline collocation matrix is numerically rank deficient at the configured "
+                    f"pseudo-inverse cutoff for p={degree}, M={coefficient_count}, horizon={horizon}; "
+                    "choose a smaller degree or coefficient count."
+                )
+            # pinv(B) is the fixed ordinary-least-squares analysis operator.
+            # Keep the source matrices as unregistered CPU float64 tensors so a
+            # policy-wide bf16/fp16 conversion cannot destroy their precision.
+            analysis = torch.linalg.pinv(design, rtol=pinv_rtol)
+            coefficient_identity = torch.eye(coefficient_count, dtype=design.dtype)
+            coefficient_recovery_error = torch.max(
+                torch.abs(analysis @ design - coefficient_identity)
+            ).item()
+            if coefficient_recovery_error > 1e-8:
+                raise ValueError(
+                    "B-spline collocation matrix is too ill-conditioned for stable coefficient recovery "
+                    f"for p={degree}, M={coefficient_count}, horizon={horizon}; "
+                    "choose a smaller degree or coefficient count."
+                )
+            if coefficient_count == horizon:
+                sample_identity = torch.eye(horizon, dtype=design.dtype)
+                sample_reconstruction_error = torch.max(
+                    torch.abs(design @ analysis - sample_identity)
+                ).item()
+                if sample_reconstruction_error > 1e-8:
+                    raise ValueError(
+                        "B-spline M=H fit is not numerically lossless for "
+                        f"p={degree}, M={coefficient_count}, horizon={horizon}; "
+                        "choose a smaller degree."
+                    )
+            self._bspline_analysis_cpu = analysis
+            self._bspline_derivative_basis_cpu = derivative_basis
         if not self.config.gripper_first and self.action_dim < 2:
             raise ValueError("gripper_first=False requires at least one non-gripper action dimension.")
+
+    def _uses_legacy_central_action_stencil(self) -> bool:
+        return self.interpolation_mode == "dct" and self.config.dct_coe_num == 0
+
+    def _bspline_matrices(self, reference: Tensor, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        if self._bspline_analysis_cpu is None or self._bspline_derivative_basis_cpu is None:
+            raise RuntimeError("B-spline matrices requested outside interpolation_mode='bspline'")
+        key = (reference.device, dtype)
+        matrices = self._bspline_matrix_cache.get(key)
+        if matrices is None:
+            matrices = (
+                self._bspline_analysis_cpu.to(device=reference.device, dtype=dtype),
+                self._bspline_derivative_basis_cpu.to(device=reference.device, dtype=dtype),
+            )
+            self._bspline_matrix_cache[key] = matrices
+        return matrices
 
     def _effective_lambda_flow_k(self, train_step: int | None) -> float:
         if train_step is not None and train_step < self.config.pre_train_steps:
@@ -941,7 +1130,7 @@ class FlowMatchingObjective(nn.Module):
     ) -> tuple[Tensor, dict]:
         action_sequence = batch[ACTION]
         uses_central_action_stencil = (
-            self.config.lambda_flow_k > 0 and self.config.dct_coe_num == 0
+            self.config.lambda_flow_k > 0 and self._uses_legacy_central_action_stencil()
         )
         expected_action_frames = self.horizon + 2 * int(uses_central_action_stencil)
         expected_action_shape = (action_sequence.shape[0], expected_action_frames, self.action_dim)
@@ -949,7 +1138,7 @@ class FlowMatchingObjective(nn.Module):
             raise ValueError(
                 f"Flow-matching actions must have shape {expected_action_shape} for "
                 f"lambda_flow_k={self.config.lambda_flow_k} and "
-                f"dct_coe_num={self.config.dct_coe_num}, got {tuple(action_sequence.shape)}"
+                f"interpolation_mode={self.interpolation_mode}, got {tuple(action_sequence.shape)}"
             )
         if "action_is_pad" in batch:
             expected_pad_shape = expected_action_shape[:2]
@@ -1070,7 +1259,7 @@ class FlowMatchingObjective(nn.Module):
         return fps_tensor.reshape(reference.shape[0], *([1] * (reference.ndim - 1)))
 
     def _action_dot(self, action_sequence: Tensor, fps: Tensor) -> Tensor:
-        if self.config.dct_coe_num == 0:
+        if self.interpolation_mode == "dct" and self.config.dct_coe_num == 0:
             expected_frames = self.horizon + 2
             if action_sequence.shape[1] != expected_frames:
                 raise ValueError(
@@ -1084,16 +1273,24 @@ class FlowMatchingObjective(nn.Module):
 
         num_samples = self.horizon
         if action_sequence.shape[1] != num_samples:
+            representation = "B-spline" if self.interpolation_mode == "bspline" else "DCT"
             raise ValueError(
-                f"DCT action derivative requires exactly horizon ({num_samples}) action frames, "
+                f"{representation} action derivative requires exactly horizon ({num_samples}) action frames, "
                 f"got {action_sequence.shape[1]}"
             )
 
-        num_modes = self.config.dct_coe_num
         input_dtype = action_sequence.dtype
         compute_dtype = torch.float32 if input_dtype in {torch.float16, torch.bfloat16} else input_dtype
         with _disabled_autocast_context(action_sequence.device):
             actions = action_sequence.to(dtype=compute_dtype)
+            if self.interpolation_mode == "bspline":
+                analysis, derivative_basis = self._bspline_matrices(actions, compute_dtype)
+                coefficients = torch.einsum("mh,bhd->bmd", analysis, actions)
+                action_dot = torch.einsum("hm,bmd->bhd", derivative_basis, coefficients)
+                action_dot = action_dot * (fps.to(dtype=compute_dtype) / (self.horizon - 1))
+                return action_dot.to(dtype=input_dtype)
+
+            num_modes = self.config.dct_coe_num
             modes = torch.arange(num_modes, device=actions.device, dtype=compute_dtype)
             sample_points = torch.arange(num_samples, device=actions.device, dtype=compute_dtype) + 0.5
             alpha = torch.full_like(modes, math.sqrt(2.0 / num_samples))
@@ -1182,17 +1379,22 @@ class FlowMatchingObjective(nn.Module):
 
         if "action_is_pad" in batch:
             action_is_pad = batch["action_is_pad"].to(device=data.device, dtype=torch.bool)
-            expected_frames = self.horizon + 2 * int(self.config.dct_coe_num == 0)
+            uses_central_action_stencil = self._uses_legacy_central_action_stencil()
+            expected_frames = self.horizon + 2 * int(uses_central_action_stencil)
             expected_shape = (data.shape[0], expected_frames)
             if action_is_pad.shape != expected_shape:
                 raise ValueError(
                     f"action_is_pad must have shape {expected_shape} for "
-                    f"dct_coe_num={self.config.dct_coe_num}, got {tuple(action_is_pad.shape)}"
+                    f"interpolation_mode={self.interpolation_mode}, got {tuple(action_is_pad.shape)}"
                 )
-            if self.config.dct_coe_num == 0:
+            if uses_central_action_stencil:
                 action_valid = ~action_is_pad[:, 1 : data.shape[1] + 1]
                 action_valid &= ~action_is_pad[:, : data.shape[1]]
                 action_valid &= ~action_is_pad[:, 2 : data.shape[1] + 2]
+            elif self.interpolation_mode == "bspline":
+                # Every least-squares coefficient depends on the complete H-step
+                # chunk, so one padded sample invalidates every analytic derivative.
+                action_valid = (~action_is_pad.any(dim=1))[:, None].expand(-1, data.shape[1])
             else:
                 action_valid = ~action_is_pad[:, : data.shape[1]]
             kinematic_valid &= action_valid

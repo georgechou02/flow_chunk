@@ -16,6 +16,7 @@
 
 import logging
 from dataclasses import dataclass, field
+from numbers import Integral
 
 from lerobot.configs import NormalizationMode, PreTrainedConfig
 from lerobot.optim import AdamConfig, DiffuserSchedulerConfig
@@ -65,8 +66,11 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     use_1_k: bool = False  # Scale the state JVP by (1 - flow time) when use_jvp_ak is disabled
     gripper_first: bool = True  # Include the final gripper action dimension in kinematic/JVP loss
     enable_stochastic: bool = False  # Compute kinematic JVP loss at one random horizon step
-    sample_frequency: float = 10.0  # Dataset/control frequency in Hz for finite differences
+    sample_frequency: float = 10.0  # Dataset/control frequency in Hz for action derivatives
+    interpolation_mode: str = "dct"  # Action derivative representation: "dct" or "bspline"
     dct_coe_num: int = 0  # Retained DCT modes; 0 uses H+2-point central differences
+    bspline_degree: int = 0  # B-spline degree p; required only for interpolation_mode="bspline"
+    bspline_coe_num: int = 0  # Coefficient count M; M<horizon gives least-squares smoothing
     conditioning_derivative_mode: str = "reverse"  # "reverse", "forward", or "central"
     image_only_condition_jvp: bool = False  # Keep only image features in the conditioning JVP tangent
 
@@ -192,10 +196,29 @@ class MultiTaskDiTConfig(PreTrainedConfig):
             raise ValueError(f"pre_train_steps must be >= 0, got {self.pre_train_steps}")
         if self.sample_frequency <= 0:
             raise ValueError(f"sample_frequency must be > 0, got {self.sample_frequency}")
+        self.interpolation_mode = self.interpolation_mode.lower()
+        if self.interpolation_mode not in {"dct", "bspline"}:
+            raise ValueError(
+                "interpolation_mode must be 'dct' or 'bspline', "
+                f"got '{self.interpolation_mode}'"
+            )
         if not 0 <= self.dct_coe_num <= self.horizon:
             raise ValueError(
                 f"dct_coe_num must be in [0, horizon] (got {self.dct_coe_num} for horizon={self.horizon})"
             )
+        if self.interpolation_mode == "bspline":
+            if (
+                isinstance(self.bspline_degree, bool)
+                or not isinstance(self.bspline_degree, Integral)
+                or isinstance(self.bspline_coe_num, bool)
+                or not isinstance(self.bspline_coe_num, Integral)
+            ):
+                raise ValueError("bspline_degree (p) and bspline_coe_num (M) must be integers")
+            if not 2 <= self.bspline_degree < self.bspline_coe_num <= self.horizon:
+                raise ValueError(
+                    "bspline mode requires 2 <= bspline_degree < bspline_coe_num <= horizon "
+                    f"(got p={self.bspline_degree}, M={self.bspline_coe_num}, horizon={self.horizon})"
+                )
         if self.conditioning_derivative_mode not in {"reverse", "forward", "central"}:
             raise ValueError(
                 "conditioning_derivative_mode must be 'reverse', 'forward', or 'central', "
@@ -301,10 +324,14 @@ class MultiTaskDiTConfig(PreTrainedConfig):
 
     @property
     def action_delta_indices(self) -> list:
-        # DCT differentiates exactly the H-point action chunk used by the flow model.
-        # Central differences require one neighboring action on each side of that chunk.
+        # DCT with K>0 and B-spline both differentiate exactly the H-point action
+        # chunk used by the flow model.  Legacy DCT K=0 central differences need
+        # one neighboring action on each side of that chunk.
         needs_central_difference_stencil = (
-            self.is_flow_matching and self.lambda_flow_k > 0 and self.dct_coe_num == 0
+            self.is_flow_matching
+            and self.lambda_flow_k > 0
+            and self.interpolation_mode == "dct"
+            and self.dct_coe_num == 0
         )
         start = 1 - self.n_obs_steps
         if needs_central_difference_stencil:

@@ -30,8 +30,17 @@
   # POLICY_LAMBDA_FLOW_K='[0.01]' \
   # POLICY_USE_JVP_AK='[false]' \
   # POLICY_USE_1_K=false \
+  # INTERPOLATION_MODE=dct \
   # POLICY_DCT_COE_NUM='[48]' \
   # ENV_EVAL_FREQ=0 \
+  # bash train_multitask_dit.sh
+
+  # # B-spline starting point (not a claimed optimum): p and M are required;
+  # # M < H smooths noise and should be tuned on the target robot data.
+  # INTERPOLATION_MODE=bspline \
+  # BSPLINE_DEGREE='[3]' \
+  # BSPLINE_COE_NUM='[24]' \
+  # RUN_SEEDS='[1000]' \
   # bash train_multitask_dit.sh
 
   # # 两个独立单卡实验
@@ -53,6 +62,19 @@
   # - 单卡实验，NUM_WORKERS=24 → 总共 24 个
   # - 四卡实验，NUM_WORKERS=24 → 总共 96 个
   # - 两个四卡实验，NUM_WORKERS=24 → 总共 192 个
+
+
+# # 原 DCT
+# INTERPOLATION_MODE=dct \
+# POLICY_DCT_COE_NUM='[48]' \
+# bash train_multitask_dit.sh
+
+# # B-spline；p/M 均支持列表 sweep
+# INTERPOLATION_MODE=bspline \
+# BSPLINE_DEGREE='[3]' \
+# BSPLINE_COE_NUM='[24,32,48]' \
+# bash train_multitask_dit.sh
+
 
 
 # 显存大是因为现在对两帧都求了jvp
@@ -116,10 +138,13 @@ PRE_TRAIN_STEPS="${PRE_TRAIN_STEPS:-${POLICY_PRE_TRAIN_STEPS:-0}}"
 # POLICY_DCT_COE_NUM="${POLICY_DCT_COE_NUM:-0}"
 POLICY_LAMBDA_FLOW_K="${POLICY_LAMBDA_FLOW_K:-0.01}"
 POLICY_USE_JVP_AK="${POLICY_USE_JVP_AK:-True}"
-STOPGRAD_AK="${STOPGRAD_AK:-False}"
+STOPGRAD_AK="${STOPGRAD_AK:-True}"
 POLICY_USE_1_K="${POLICY_USE_1_K:-false}"
 POLICY_ENABLE_STOCHASTIC="${POLICY_ENABLE_STOCHASTIC:-false}"
+POLICY_INTERPOLATION_MODE="${POLICY_INTERPOLATION_MODE:-${INTERPOLATION_MODE:-dct}}"
 POLICY_DCT_COE_NUM="${POLICY_DCT_COE_NUM:-48}"
+POLICY_BSPLINE_DEGREE="${POLICY_BSPLINE_DEGREE:-${BSPLINE_DEGREE:-}}"
+POLICY_BSPLINE_COE_NUM="${POLICY_BSPLINE_COE_NUM:-${BSPLINE_COE_NUM:-}}"
 POLICY_CONDITIONING_DERIVATIVE_MODE="${POLICY_CONDITIONING_DERIVATIVE_MODE:-central}"
 POLICY_IMAGE_ONLY_CONDITION_JVP="${POLICY_IMAGE_ONLY_CONDITION_JVP:-false}"
 
@@ -179,15 +204,19 @@ elif isinstance(parsed, (list, tuple, set)):
 else:
     raise SystemExit(f"Unsupported {kind} list syntax: {spec}")
 
-if kind == "dct_coe_num":
+if kind in {"dct_coe_num", "bspline_degree", "bspline_coe_num"}:
     normalized_values = []
     for value in values:
         text = str(value).strip()
         if not re.fullmatch(r"[0-9]+", text):
-            raise SystemExit(f"dct_coe_num must be a non-negative integer, got {value!r}")
+            raise SystemExit(f"{kind} must be a non-negative integer, got {value!r}")
         value = int(text)
-        if value > 48:
+        if kind == "dct_coe_num" and value > 48:
             raise SystemExit(f"dct_coe_num must not exceed the configured horizon 48, got {value}")
+        if kind == "bspline_degree" and not 2 <= value < 48:
+            raise SystemExit(f"bspline_degree must be in [2, 47] for horizon 48, got {value}")
+        if kind == "bspline_coe_num" and not 3 <= value <= 48:
+            raise SystemExit(f"bspline_coe_num must be in [3, 48] for horizon 48, got {value}")
         normalized_values.append(value)
     values = normalized_values
 
@@ -202,7 +231,7 @@ for value in values:
         if float(text) < 0:
             raise SystemExit("lambda_flow_k must be non-negative")
         print(text)
-    elif kind == "dct_coe_num":
+    elif kind in {"dct_coe_num", "bspline_degree", "bspline_coe_num"}:
         print(value)
     elif kind in {"use_jvp_ak", "stopgrad_ak", "image_only_condition_jvp"}:
         text = str(value).strip().lower()
@@ -241,8 +270,20 @@ run_group_for() {
   local use_jvp_ak="$2"
   local stopgrad_ak="$3"
   local image_only_condition_jvp="$4"
-  local dct_coe_num="$5"
-  echo "${RUN_PREFIX}_kinematic_$(safe_tag "$lambda_flow_k")_use_ak_$(safe_tag "$use_jvp_ak")_stopgrad_ak_$(safe_tag "$stopgrad_ak")_use_1_k_$(safe_tag "$POLICY_USE_1_K")_tangent_$(safe_tag "$POLICY_CONDITIONING_DERIVATIVE_MODE")_image_only_jvp_$(safe_tag "$image_only_condition_jvp")_stochastic_$(safe_tag "$POLICY_ENABLE_STOCHASTIC")_dct_$(safe_tag "$dct_coe_num")_batch_size${BATCH_SIZE}_steps${STEPS}_pre_train_steps${PRE_TRAIN_STEPS}"
+  local interpolation_mode="$5"
+  local dct_coe_num="$6"
+  local bspline_degree="$7"
+  local bspline_coe_num="$8"
+  local interpolation_tag
+  if [[ "$interpolation_mode" == "bspline" ]]; then
+    # Compact because the legacy RUN_PREFIX already sits close to Linux's
+    # 255-byte filename-component limit.
+    interpolation_tag="bsp$(safe_tag "$bspline_degree")m$(safe_tag "$bspline_coe_num")"
+  else
+    # Keep the historical DCT run name byte-for-byte compatible.
+    interpolation_tag="dct_$(safe_tag "$dct_coe_num")"
+  fi
+  echo "${RUN_PREFIX}_kinematic_$(safe_tag "$lambda_flow_k")_use_ak_$(safe_tag "$use_jvp_ak")_stopgrad_ak_$(safe_tag "$stopgrad_ak")_use_1_k_$(safe_tag "$POLICY_USE_1_K")_tangent_$(safe_tag "$POLICY_CONDITIONING_DERIVATIVE_MODE")_image_only_jvp_$(safe_tag "$image_only_condition_jvp")_stochastic_$(safe_tag "$POLICY_ENABLE_STOCHASTIC")_${interpolation_tag}_batch_size${BATCH_SIZE}_steps${STEPS}_pre_train_steps${PRE_TRAIN_STEPS}"
 }
 
 run_path_for() {
@@ -252,8 +293,11 @@ run_path_for() {
   local use_jvp_ak="$4"
   local stopgrad_ak="$5"
   local image_only_condition_jvp="$6"
-  local dct_coe_num="$7"
-  echo "${OUTPUT_ROOT%/}/${kind}/$(run_group_for "$lambda_flow_k" "$use_jvp_ak" "$stopgrad_ak" "$image_only_condition_jvp" "$dct_coe_num")_${RUN_TIMESTAMP}/seed${seed}"
+  local interpolation_mode="$7"
+  local dct_coe_num="$8"
+  local bspline_degree="$9"
+  local bspline_coe_num="${10}"
+  echo "${OUTPUT_ROOT%/}/${kind}/$(run_group_for "$lambda_flow_k" "$use_jvp_ak" "$stopgrad_ak" "$image_only_condition_jvp" "$interpolation_mode" "$dct_coe_num" "$bspline_degree" "$bspline_coe_num")_${RUN_TIMESTAMP}/seed${seed}"
 }
 
 run_one() {
@@ -263,7 +307,10 @@ run_one() {
   local use_jvp_ak="$4"
   local stopgrad_ak="$5"
   local image_only_condition_jvp="$6"
-  local dct_coe_num="$7"
+  local interpolation_mode="$7"
+  local dct_coe_num="$8"
+  local bspline_degree="$9"
+  local bspline_coe_num="${10}"
   local -a group_gpus
   local num_processes
   local out
@@ -277,15 +324,15 @@ run_one() {
   IFS=',' read -r -a group_gpus <<< "$gpu_group"
   num_processes="${#group_gpus[@]}"
 
-  out="$(run_path_for train "$seed" "$lambda_flow_k" "$use_jvp_ak" "$stopgrad_ak" "$image_only_condition_jvp" "$dct_coe_num")"
-  eval_out="$(run_path_for eval "$seed" "$lambda_flow_k" "$use_jvp_ak" "$stopgrad_ak" "$image_only_condition_jvp" "$dct_coe_num")"
-  run_group="$(run_group_for "$lambda_flow_k" "$use_jvp_ak" "$stopgrad_ak" "$image_only_condition_jvp" "$dct_coe_num")"
+  out="$(run_path_for train "$seed" "$lambda_flow_k" "$use_jvp_ak" "$stopgrad_ak" "$image_only_condition_jvp" "$interpolation_mode" "$dct_coe_num" "$bspline_degree" "$bspline_coe_num")"
+  eval_out="$(run_path_for eval "$seed" "$lambda_flow_k" "$use_jvp_ak" "$stopgrad_ak" "$image_only_condition_jvp" "$interpolation_mode" "$dct_coe_num" "$bspline_degree" "$bspline_coe_num")"
+  run_group="$(run_group_for "$lambda_flow_k" "$use_jvp_ak" "$stopgrad_ak" "$image_only_condition_jvp" "$interpolation_mode" "$dct_coe_num" "$bspline_degree" "$bspline_coe_num")"
   job_name="${run_group}_seed${seed}"
   wandb_group="${WANDB_GROUP:-$run_group}"
   wandb_notes="${WANDB_NOTES:-LOG_DIR:${wandb_group}}"
   wandb_tags="${WANDB_TAGS:-[\"LOG_DIR:$(safe_tag "$wandb_group")\"]}"
 
-  echo "seed=${seed} gpu=${gpu_group} num_processes=${num_processes} eval_suites=${EVAL_SUITES} lambda_flow_k=${lambda_flow_k} use_jvp_ak=${use_jvp_ak} stopgrad_ak=${stopgrad_ak} use_1_k=${POLICY_USE_1_K} tangent=${POLICY_CONDITIONING_DERIVATIVE_MODE} image_only_condition_jvp=${image_only_condition_jvp} enable_stochastic=${POLICY_ENABLE_STOCHASTIC} dct_coe_num=${dct_coe_num} pre_train_steps=${PRE_TRAIN_STEPS} out=${out} eval_out=${eval_out} wandb_group=${wandb_group}"
+  echo "seed=${seed} gpu=${gpu_group} num_processes=${num_processes} eval_suites=${EVAL_SUITES} lambda_flow_k=${lambda_flow_k} use_jvp_ak=${use_jvp_ak} stopgrad_ak=${stopgrad_ak} use_1_k=${POLICY_USE_1_K} tangent=${POLICY_CONDITIONING_DERIVATIVE_MODE} image_only_condition_jvp=${image_only_condition_jvp} enable_stochastic=${POLICY_ENABLE_STOCHASTIC} interpolation_mode=${interpolation_mode} dct_coe_num=${dct_coe_num} bspline_degree=${bspline_degree} bspline_coe_num=${bspline_coe_num} pre_train_steps=${PRE_TRAIN_STEPS} out=${out} eval_out=${eval_out} wandb_group=${wandb_group}"
 
   if [[ -d "$out" && "$RESUME" != "true" && "${DRY_RUN:-0}" != "1" ]]; then
     echo "Output directory already exists: ${out}" >&2
@@ -356,7 +403,7 @@ run_one() {
     --policy.gripper_first=false
     --policy.enable_stochastic="${POLICY_ENABLE_STOCHASTIC}"
     --policy.sample_frequency=10.0
-    --policy.dct_coe_num="${dct_coe_num}"
+    --policy.interpolation_mode="${interpolation_mode}"
     --policy.num_integration_steps=32
     --policy.integration_method=euler
     --policy.timestep_sampling_strategy=beta
@@ -386,6 +433,15 @@ run_one() {
     --output_dir="${out}"
     --policy.push_to_hub=false
   )
+
+  if [[ "$interpolation_mode" == "bspline" ]]; then
+    cmd+=(
+      --policy.bspline_degree="${bspline_degree}"
+      --policy.bspline_coe_num="${bspline_coe_num}"
+    )
+  else
+    cmd+=(--policy.dct_coe_num="${dct_coe_num}")
+  fi
 
   if [[ -n "$WANDB_ENTITY" ]]; then
     cmd+=(--wandb.entity="${WANDB_ENTITY}")
@@ -418,16 +474,51 @@ case "$POLICY_CONDITIONING_DERIVATIVE_MODE" in
     ;;
 esac
 
+POLICY_INTERPOLATION_MODE="${POLICY_INTERPOLATION_MODE,,}"
+case "$POLICY_INTERPOLATION_MODE" in
+  dct|bspline) ;;
+  *)
+    echo "INTERPOLATION_MODE/POLICY_INTERPOLATION_MODE must be dct or bspline; got '${POLICY_INTERPOLATION_MODE}'." >&2
+    exit 1
+    ;;
+esac
+
 mapfile -t SEEDS_ARRAY < <(parse_list "$RUN_SEEDS" seed)
 mapfile -t GPUS_ARRAY < <(parse_list "$GPUS" gpu)
 mapfile -t LAMBDAS < <(parse_list "$POLICY_LAMBDA_FLOW_K" lambda_flow_k)
 mapfile -t USE_JVP_AKS < <(parse_list "$POLICY_USE_JVP_AK" use_jvp_ak)
 mapfile -t STOPGRAD_AKS < <(parse_list "$STOPGRAD_AK" stopgrad_ak)
 mapfile -t IMAGE_ONLY_CONDITION_JVPS < <(parse_list "$POLICY_IMAGE_ONLY_CONDITION_JVP" image_only_condition_jvp)
-mapfile -t DCT_COE_NUMS < <(parse_list "$POLICY_DCT_COE_NUM" dct_coe_num)
 
-if (( ${#SEEDS_ARRAY[@]} == 0 || ${#GPUS_ARRAY[@]} == 0 || ${#LAMBDAS[@]} == 0 || ${#USE_JVP_AKS[@]} == 0 || ${#STOPGRAD_AKS[@]} == 0 || ${#IMAGE_ONLY_CONDITION_JVPS[@]} == 0 || ${#DCT_COE_NUMS[@]} == 0 )); then
-  echo "Empty seed/GPU/lambda/use_jvp_ak/stopgrad_ak/image_only_condition_jvp/dct_coe_num list." >&2
+INTERPOLATION_SPECS=()
+DCT_COE_NUMS=()
+BSPLINE_DEGREES=()
+BSPLINE_COE_NUMS=()
+if [[ "$POLICY_INTERPOLATION_MODE" == "dct" ]]; then
+  mapfile -t DCT_COE_NUMS < <(parse_list "$POLICY_DCT_COE_NUM" dct_coe_num)
+  for dct_coe_num in "${DCT_COE_NUMS[@]}"; do
+    INTERPOLATION_SPECS+=("dct|${dct_coe_num}||")
+  done
+else
+  if [[ -z "$POLICY_BSPLINE_DEGREE" || -z "$POLICY_BSPLINE_COE_NUM" ]]; then
+    echo "bspline mode requires explicit BSPLINE_DEGREE/POLICY_BSPLINE_DEGREE and BSPLINE_COE_NUM/POLICY_BSPLINE_COE_NUM." >&2
+    exit 1
+  fi
+  mapfile -t BSPLINE_DEGREES < <(parse_list "$POLICY_BSPLINE_DEGREE" bspline_degree)
+  mapfile -t BSPLINE_COE_NUMS < <(parse_list "$POLICY_BSPLINE_COE_NUM" bspline_coe_num)
+  for bspline_degree in "${BSPLINE_DEGREES[@]}"; do
+    for bspline_coe_num in "${BSPLINE_COE_NUMS[@]}"; do
+      if (( bspline_degree >= bspline_coe_num )); then
+        echo "bspline mode requires p < M, got p=${bspline_degree}, M=${bspline_coe_num}." >&2
+        exit 1
+      fi
+      INTERPOLATION_SPECS+=("bspline||${bspline_degree}|${bspline_coe_num}")
+    done
+  done
+fi
+
+if (( ${#SEEDS_ARRAY[@]} == 0 || ${#GPUS_ARRAY[@]} == 0 || ${#LAMBDAS[@]} == 0 || ${#USE_JVP_AKS[@]} == 0 || ${#STOPGRAD_AKS[@]} == 0 || ${#IMAGE_ONLY_CONDITION_JVPS[@]} == 0 || ${#INTERPOLATION_SPECS[@]} == 0 )); then
+  echo "Empty seed/GPU/lambda/use_jvp_ak/stopgrad_ak/image_only_condition_jvp/interpolation parameter list." >&2
   exit 1
 fi
 
@@ -437,8 +528,8 @@ for seed in "${SEEDS_ARRAY[@]}"; do
     for use_jvp_ak in "${USE_JVP_AKS[@]}"; do
       for stopgrad_ak in "${STOPGRAD_AKS[@]}"; do
         for image_only_condition_jvp in "${IMAGE_ONLY_CONDITION_JVPS[@]}"; do
-          for dct_coe_num in "${DCT_COE_NUMS[@]}"; do
-            RUNS+=("${seed}|${lambda_flow_k}|${use_jvp_ak}|${stopgrad_ak}|${image_only_condition_jvp}|${dct_coe_num}")
+          for interpolation_spec in "${INTERPOLATION_SPECS[@]}"; do
+            RUNS+=("${seed}|${lambda_flow_k}|${use_jvp_ak}|${stopgrad_ak}|${image_only_condition_jvp}|${interpolation_spec}")
           done
         done
       done
@@ -465,7 +556,13 @@ echo "use_1_k=${POLICY_USE_1_K}"
 echo "conditioning_derivative_mode=${POLICY_CONDITIONING_DERIVATIVE_MODE}"
 echo "image_only_condition_jvp=${IMAGE_ONLY_CONDITION_JVPS[*]}"
 echo "enable_stochastic=${POLICY_ENABLE_STOCHASTIC}"
-echo "dct_coe_num=${DCT_COE_NUMS[*]}"
+echo "interpolation_mode=${POLICY_INTERPOLATION_MODE}"
+if [[ "$POLICY_INTERPOLATION_MODE" == "dct" ]]; then
+  echo "dct_coe_num=${DCT_COE_NUMS[*]}"
+else
+  echo "bspline_degree=${BSPLINE_DEGREES[*]}"
+  echo "bspline_coe_num=${BSPLINE_COE_NUMS[*]}"
+fi
 echo "output_root=${OUTPUT_ROOT}"
 echo "run_timestamp=${RUN_TIMESTAMP}"
 echo "runs=${NUM_RUNS}"
@@ -483,14 +580,14 @@ for ((start = 0; start < NUM_RUNS; start += NUM_GPU_GROUPS)); do
       break
     fi
 
-    IFS='|' read -r seed lambda_flow_k use_jvp_ak stopgrad_ak image_only_condition_jvp dct_coe_num <<< "${RUNS[$run_idx]}"
+    IFS='|' read -r seed lambda_flow_k use_jvp_ak stopgrad_ak image_only_condition_jvp interpolation_mode dct_coe_num bspline_degree bspline_coe_num <<< "${RUNS[$run_idx]}"
     gpu_group="${GPUS_ARRAY[$gpu_group_idx]}"
-    log_file="$(run_path_for train_logs "$seed" "$lambda_flow_k" "$use_jvp_ak" "$stopgrad_ak" "$image_only_condition_jvp" "$dct_coe_num").log"
-    label="seed ${seed}, lambda_flow_k ${lambda_flow_k}, use_jvp_ak ${use_jvp_ak}, stopgrad_ak ${stopgrad_ak}, image_only_condition_jvp ${image_only_condition_jvp}, dct_coe_num ${dct_coe_num}, gpus ${gpu_group}"
+    log_file="$(run_path_for train_logs "$seed" "$lambda_flow_k" "$use_jvp_ak" "$stopgrad_ak" "$image_only_condition_jvp" "$interpolation_mode" "$dct_coe_num" "$bspline_degree" "$bspline_coe_num").log"
+    label="seed ${seed}, lambda_flow_k ${lambda_flow_k}, use_jvp_ak ${use_jvp_ak}, stopgrad_ak ${stopgrad_ak}, image_only_condition_jvp ${image_only_condition_jvp}, interpolation_mode ${interpolation_mode}, dct_coe_num ${dct_coe_num}, bspline_degree ${bspline_degree}, bspline_coe_num ${bspline_coe_num}, gpus ${gpu_group}"
 
     mkdir -p "$(dirname "$log_file")"
     echo "launch ${label}; log=${log_file}"
-    (run_one "$seed" "$gpu_group" "$lambda_flow_k" "$use_jvp_ak" "$stopgrad_ak" "$image_only_condition_jvp" "$dct_coe_num") >"$log_file" 2>&1 &
+    (run_one "$seed" "$gpu_group" "$lambda_flow_k" "$use_jvp_ak" "$stopgrad_ak" "$image_only_condition_jvp" "$interpolation_mode" "$dct_coe_num" "$bspline_degree" "$bspline_coe_num") >"$log_file" 2>&1 &
     pids+=("$!")
     labels+=("$label")
     logs+=("$log_file")
