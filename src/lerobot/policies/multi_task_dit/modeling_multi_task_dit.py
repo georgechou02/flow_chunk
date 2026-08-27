@@ -1199,7 +1199,26 @@ class FlowMatchingObjective(nn.Module):
             target_velocity,
             action_is_pad=flow_action_is_pad,
         )
-        total_loss = flow_loss + effective_lambda_flow_k * kinematic_loss
+        physical_loss = data.new_zeros(())
+        phy_loss_weight = float(self.config.phy_loss_weight)
+        flow_error = predicted_velocity - target_velocity
+        physical_flow_error = flow_error if phy_loss_weight > 0 else flow_error.detach()
+        fps = self._sample_frequency(batch, data)
+        physical_grad_context = nullcontext() if phy_loss_weight > 0 else torch.no_grad()
+        with physical_grad_context:
+            g_flow_error = self._physical_action_dot(physical_flow_error, fps)
+            physical_residual = t_expanded * (1 - t_expanded) * g_flow_error
+            physical_action_mask = self._kinematic_action_mask(data)
+            physical_loss = self._physical_residual_mean(
+                physical_residual[..., physical_action_mask].square(),
+                action_is_pad=flow_action_is_pad,
+            )
+        weighted_physical_loss = (
+            phy_loss_weight * physical_loss if phy_loss_weight > 0 else data.new_zeros(())
+        )
+        total_loss = (
+            flow_loss + effective_lambda_flow_k * kinematic_loss + weighted_physical_loss
+        )
 
         output_dict = {
             "flow_loss": flow_loss.detach().float().item(),
@@ -1210,9 +1229,10 @@ class FlowMatchingObjective(nn.Module):
             "train_step": int(train_step) if train_step is not None else -1,
             "use_jvp_ak": float(self.config.use_jvp_ak),
             "stop_gradient_jvp_ak": float(self.config.stop_gradient_jvp_ak),
-            "use_1_k": float(self.config.use_1_k),
             "gripper_first": float(self.config.gripper_first),
-            "enable_stochastic": float(self.config.enable_stochastic),
+            "physical_loss": physical_loss.detach().float().item(),
+            "phy_loss_weight": phy_loss_weight,
+            "weighted_physical_loss": weighted_physical_loss.detach().float().item(),
             "total_loss": total_loss.detach().float().item(),
             "kinematic_valid_ratio": kinematic_valid_ratio.detach().float().item(),
         }
@@ -1241,6 +1261,49 @@ class FlowMatchingObjective(nn.Module):
             return (loss * mask).sum() / num_valid.clamp_min(1)
 
         return loss.mean()
+
+    def _masked_action_mean(
+        self,
+        values: Tensor,
+        action_is_pad: Tensor | None = None,
+    ) -> Tensor:
+        if self.do_mask_loss_for_padding and action_is_pad is not None:
+            expected_shape = values.shape[:2]
+            if action_is_pad.shape != expected_shape:
+                raise ValueError(
+                    f"Physical action_is_pad must have shape {expected_shape}, "
+                    f"got {tuple(action_is_pad.shape)}"
+                )
+            mask = ~action_is_pad.to(device=values.device, dtype=torch.bool).unsqueeze(-1)
+            num_valid = mask.sum() * values.shape[-1]
+            return (values * mask).sum() / num_valid.clamp_min(1)
+
+        return values.mean()
+
+    def _physical_residual_mean(
+        self,
+        values: Tensor,
+        action_is_pad: Tensor | None = None,
+    ) -> Tensor:
+        """Average physical residuals over valid continuous-action chunks."""
+        if self.interpolation_mode != "bspline" or action_is_pad is None:
+            return self._masked_action_mean(values, action_is_pad=action_is_pad)
+
+        expected_shape = values.shape[:2]
+        if action_is_pad.shape != expected_shape:
+            raise ValueError(
+                f"Physical action_is_pad must have shape {expected_shape}, "
+                f"got {tuple(action_is_pad.shape)}"
+            )
+
+        # A B-spline derivative at any query point depends on the complete
+        # fitted action chunk. If one action is padded, none of the chunk's
+        # physical derivatives are valid, irrespective of the flow-loss
+        # padding setting.
+        valid_chunks = ~action_is_pad.to(device=values.device, dtype=torch.bool).any(dim=1)
+        valid = valid_chunks[:, None, None].to(dtype=values.dtype)
+        num_valid_values = valid.sum() * values.shape[1] * values.shape[2]
+        return (values * valid).sum() / num_valid_values.clamp_min(1)
 
     def _sample_frequency(self, batch: dict[str, Tensor], reference: Tensor) -> Tensor:
         fps = batch.get("sample_frequency")
@@ -1305,6 +1368,39 @@ class FlowMatchingObjective(nn.Module):
             action_dot = action_dot * fps.to(dtype=compute_dtype)
 
         return action_dot.to(dtype=input_dtype)
+
+    def _physical_action_dot(self, flow_error: Tensor, fps: Tensor) -> Tensor:
+        """Differentiate an H-frame flow error without changing the legacy JVP stencil.
+
+        DCT K=0 normally gets two neighboring action frames from the dataset. A
+        predicted flow error has only H frames, so use the same centered stencil
+        internally and second-order one-sided closures at its two boundaries.
+        """
+        if not self._uses_legacy_central_action_stencil():
+            return self._action_dot(flow_error, fps)
+        if flow_error.shape[1] != self.horizon:
+            raise ValueError(
+                "Physical central-difference derivative requires exactly horizon "
+                f"({self.horizon}) flow-error frames, got {flow_error.shape[1]}"
+            )
+        if self.horizon == 1:
+            return torch.zeros_like(flow_error)
+        if self.horizon == 2:
+            slope = (flow_error[:, 1:2] - flow_error[:, :1]) * fps
+            return slope.expand(-1, 2, -1)
+
+        first = (
+            -1.5 * flow_error[:, :1]
+            + 2.0 * flow_error[:, 1:2]
+            - 0.5 * flow_error[:, 2:3]
+        ) * fps
+        interior = (flow_error[:, 2:] - flow_error[:, :-2]) * (fps * 0.5)
+        last = (
+            0.5 * flow_error[:, -3:-2]
+            - 2.0 * flow_error[:, -2:-1]
+            + 1.5 * flow_error[:, -1:]
+        ) * fps
+        return torch.cat((first, interior, last), dim=1)
 
     def _kinematic_action_mask(self, reference: Tensor) -> Tensor:
         mask = torch.ones(self.action_dim, dtype=torch.bool, device=reference.device)
@@ -1436,96 +1532,58 @@ class FlowMatchingObjective(nn.Module):
             fps,
             derivative_conditioning_steps=derivative_conditioning_steps,
         )
-        state_jvp = None
         action_jvp = None
-        if self.config.enable_stochastic:
-            horizon_index = torch.randint(self.horizon, ()).item()
-            horizon_slice = slice(horizon_index, horizon_index + 1)
-        else:
-            horizon_slice = slice(None)
 
         def flow_vector_field_cond(cond: Tensor) -> Tensor:
-            return model(x_t, t, conditioning_vec=cond)[:, horizon_slice]
-
-        if self.config.enable_stochastic:
-            # Keep the primal flow pass eligible for Flash SDPA under the outer AMP context.
-            predicted_velocity = model(x_t, t, conditioning_vec=conditioning_vec)
+            return model(x_t, t, conditioning_vec=cond)
 
         with _disabled_autocast_context(x_t.device), _sdpa_math_kernel_context():
-            if self.config.enable_stochastic:
-                if self.config.use_jvp_ak:
-
-                    def flow_vector_field(cond: Tensor, actions: Tensor) -> Tensor:
-                        return model(actions, t, conditioning_vec=cond)[:, horizon_slice]
-
-                    _, kinematic_dot = torch.autograd.functional.jvp(
-                        flow_vector_field,
-                        (conditioning_vec, x_t),
-                        (conditioning_dot_vec, t.view(-1, 1, 1) * a_dot_data),
-                        create_graph=True,
-                    )
-                else:
-                    _, kinematic_dot = torch.autograd.functional.jvp(
-                        flow_vector_field_cond,
-                        conditioning_vec,
-                        conditioning_dot_vec,
-                        create_graph=True,
-                    )
-                    state_jvp = kinematic_dot
-                    if self.config.use_1_k:
-                        kinematic_dot = (1 - t.view(-1, 1, 1)) * kinematic_dot
-                residual = kinematic_dot - a_dot_data[:, horizon_slice]
-                if self.config.use_jvp_ak:
-                    residual = (1 - t.view(-1, 1, 1)) * residual
-            else:
-                # The conditioning and action JVPs below are two evaluations of the
-                # same vector field.  Replay the first evaluation's RNG realization
-                # for the second one so training-time dropout does not turn their sum
-                # into derivatives of two different stochastic functions.  Wrapping
-                # only the first call restores the incoming RNG state before the
-                # action JVP; the second call then advances it exactly once.
-                jvp_rng_devices = [] if x_t.device.type == "cpu" else [x_t.device]
-                jvp_rng_context = (
-                    torch.random.fork_rng(devices=jvp_rng_devices, device_type=x_t.device.type)
-                    if self.config.use_jvp_ak
-                    else nullcontext()
+            # The conditioning and action JVPs below are two evaluations of the
+            # same vector field. Replay the first evaluation's RNG realization
+            # for the second one so training-time dropout does not turn their sum
+            # into derivatives of two different stochastic functions. Wrapping
+            # only the first call restores the incoming RNG state before the
+            # action JVP; the second call then advances it exactly once.
+            jvp_rng_devices = [] if x_t.device.type == "cpu" else [x_t.device]
+            jvp_rng_context = (
+                torch.random.fork_rng(devices=jvp_rng_devices, device_type=x_t.device.type)
+                if self.config.use_jvp_ak
+                else nullcontext()
+            )
+            with jvp_rng_context:
+                predicted_velocity, v_s_dot = torch.func.jvp(
+                    flow_vector_field_cond,
+                    (conditioning_vec,),
+                    (conditioning_dot_vec,),
                 )
-                with jvp_rng_context:
-                    predicted_velocity, v_s_dot = torch.func.jvp(
-                        flow_vector_field_cond,
-                        (conditioning_vec,),
-                        (conditioning_dot_vec,),
-                    )
-                state_jvp = v_s_dot
+            state_jvp = v_s_dot
 
-                if self.config.use_jvp_ak:
+            if self.config.use_jvp_ak:
 
-                    def flow_vector_field_action(actions: Tensor) -> Tensor:
-                        return model(actions, t, conditioning_vec=conditioning_vec)
+                def flow_vector_field_action(actions: Tensor) -> Tensor:
+                    return model(actions, t, conditioning_vec=conditioning_vec)
 
-                    _, v_a_k_dot = torch.func.jvp(
-                        flow_vector_field_action,
-                        (x_t,),
-                        (a_dot_data,),
-                    )
-                    action_jvp = v_a_k_dot
-                    v_a_k_dot_for_loss = (
-                        v_a_k_dot.detach() if self.config.stop_gradient_jvp_ak else v_a_k_dot
-                    )
-                    residual = (1 - t.view(-1, 1, 1)) * (
-                        v_s_dot + t.view(-1, 1, 1) * v_a_k_dot_for_loss - a_dot_data
-                    )
-                else:
-                    if self.config.use_1_k:
-                        v_s_dot = (1 - t.view(-1, 1, 1)) * v_s_dot
-                    residual = v_s_dot - a_dot_data
+                _, v_a_k_dot = torch.func.jvp(
+                    flow_vector_field_action,
+                    (x_t,),
+                    (a_dot_data,),
+                )
+                action_jvp = v_a_k_dot
+                v_a_k_dot_for_loss = (
+                    v_a_k_dot.detach() if self.config.stop_gradient_jvp_ak else v_a_k_dot
+                )
+                residual = (1 - t.view(-1, 1, 1)) * (
+                    v_s_dot + t.view(-1, 1, 1) * v_a_k_dot_for_loss - a_dot_data
+                )
+            else:
+                residual = v_s_dot - a_dot_data
 
         kinematic_valid = self._kinematic_valid_mask(
             batch,
             data,
             conditioning_steps,
             derivative_conditioning_steps=derivative_conditioning_steps,
-        )[:, horizon_slice]
+        )
         kinematic_loss_per_step = torch.mean(residual[..., kinematic_action_mask] ** 2, dim=-1)
         valid = kinematic_valid.to(dtype=kinematic_loss_per_step.dtype)
         num_valid = valid.sum()

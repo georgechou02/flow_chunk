@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+import math
 from dataclasses import dataclass, field
 from numbers import Integral
 
@@ -63,12 +64,11 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     use_jvp_ak: bool = False  # Add action-input JVP term to kinematic loss
     # In the full-horizon JVP loss, keep the action-input JVP value but stop its kinematic gradient.
     stop_gradient_jvp_ak: bool = False
-    use_1_k: bool = False  # Scale the state JVP by (1 - flow time) when use_jvp_ak is disabled
+    phy_loss_weight: float = 0.0  # Weight for the value-level physical residual loss
     gripper_first: bool = True  # Include the final gripper action dimension in kinematic/JVP loss
-    enable_stochastic: bool = False  # Compute kinematic JVP loss at one random horizon step
     sample_frequency: float = 10.0  # Dataset/control frequency in Hz for action derivatives
     interpolation_mode: str = "dct"  # Action derivative representation: "dct" or "bspline"
-    dct_coe_num: int = 0  # Retained DCT modes; 0 uses H+2-point central differences
+    dct_coe_num: int = 0  # Retained DCT modes; 0 uses H+2 central differences for kinematic JVP
     bspline_degree: int = 0  # B-spline degree p; required only for interpolation_mode="bspline"
     bspline_coe_num: int = 0  # Coefficient count M; M<horizon gives least-squares smoothing
     conditioning_derivative_mode: str = "reverse"  # "reverse", "forward", or "central"
@@ -192,6 +192,10 @@ class MultiTaskDiTConfig(PreTrainedConfig):
             )
         if self.lambda_flow_k < 0:
             raise ValueError(f"lambda_flow_k must be >= 0, got {self.lambda_flow_k}")
+        if not math.isfinite(self.phy_loss_weight) or self.phy_loss_weight < 0:
+            raise ValueError(f"phy_loss_weight must be finite and >= 0, got {self.phy_loss_weight}")
+        if self.phy_loss_weight > 0 and self.objective != "flow_matching":
+            raise ValueError("phy_loss_weight > 0 requires objective='flow_matching'")
         if self.pre_train_steps < 0:
             raise ValueError(f"pre_train_steps must be >= 0, got {self.pre_train_steps}")
         if self.sample_frequency <= 0:
