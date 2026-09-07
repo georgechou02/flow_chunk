@@ -98,9 +98,12 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 video_backend=cfg.dataset.video_backend,
                 return_uint8=True,
                 depth_output_unit=cfg.dataset.depth_output_unit,
+                decoded_image_cache_root=cfg.dataset.decoded_image_cache_root,
                 tolerance_s=cfg.tolerance_s,
             )
         else:
+            if cfg.dataset.decoded_image_cache_root is not None:
+                raise ValueError("decoded_image_cache_root is not supported for streaming datasets.")
             dataset = StreamingLeRobotDataset(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
@@ -190,6 +193,7 @@ def make_train_eval_datasets(
         revision=cfg.dataset.revision,
         video_backend=cfg.dataset.video_backend,
         return_uint8=True,
+        decoded_image_cache_root=cfg.dataset.decoded_image_cache_root,
         tolerance_s=cfg.tolerance_s,
     )
 
@@ -202,6 +206,7 @@ def make_train_eval_datasets(
         revision=cfg.dataset.revision,
         video_backend=cfg.dataset.video_backend,
         return_uint8=True,
+        decoded_image_cache_root=cfg.dataset.decoded_image_cache_root,
         tolerance_s=cfg.tolerance_s,
     )
 

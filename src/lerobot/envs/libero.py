@@ -15,6 +15,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import ctypes
 import os
 import re
 from collections import defaultdict
@@ -22,6 +23,15 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import partial
 from pathlib import Path
 from typing import Any
+
+# Some cluster images are missing NVIDIA's system-wide GLVND registration.
+# Select the project-local NVIDIA EGL vendor before importing Robosuite/OpenGL;
+# otherwise GLVND falls back to Mesa and enumerates unusable DRM devices.
+if os.environ.get("MUJOCO_GL", "egl").strip().lower() == "egl":
+    system_nvidia_egl_vendor = Path("/usr/share/glvnd/egl_vendor.d/10_nvidia.json")
+    project_nvidia_egl_vendor = Path(__file__).resolve().parents[3] / "nvidia_egl_vendor.json"
+    if not system_nvidia_egl_vendor.is_file() and project_nvidia_egl_vendor.is_file():
+        os.environ.setdefault("__EGL_VENDOR_LIBRARY_FILENAMES", str(project_nvidia_egl_vendor))
 
 import gymnasium as gym
 import numpy as np
@@ -33,6 +43,59 @@ from libero.libero.envs import OffScreenRenderEnv
 from lerobot.types import RobotObservation
 
 from .utils import _LazyAsyncVectorEnv, parse_camera_names
+
+
+def _configure_egl_device_for_visible_cuda() -> None:
+    """Keep Robosuite EGL rendering on the CUDA device used by this process.
+
+    Robosuite treats ``CUDA_VISIBLE_DEVICES`` as an index into
+    ``eglQueryDevicesEXT()``. Those two device orders are not guaranteed to
+    match, so rendering can otherwise land on an unrelated physical GPU. The
+    NVIDIA ``EGL_CUDA_DEVICE_NV`` attribute exposes the CUDA-local ordinal for
+    each EGL device and lets us pass Robosuite the correct EGL index.
+    """
+    if os.environ.get("MUJOCO_GL", "egl").strip().lower() != "egl":
+        return
+    if os.environ.get("MUJOCO_EGL_DEVICE_ID") is not None:
+        return
+
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible_devices is not None and not visible_devices.strip():
+        return
+
+    try:
+        from OpenGL import EGL
+        from robosuite.renderers.context import egl_context
+
+        visible_count = len([device for device in (visible_devices or "").split(",") if device.strip()])
+        cuda_ordinal = 0 if visible_count <= 1 else int(os.environ.get("LOCAL_RANK", "0"))
+
+        query_address = EGL.eglGetProcAddress("eglQueryDeviceAttribEXT")
+        if not query_address:
+            raise RuntimeError("eglQueryDeviceAttribEXT is unavailable")
+        query_device_attribute = ctypes.CFUNCTYPE(
+            EGL.EGLBoolean,
+            EGL.EGLDeviceEXT,
+            EGL.EGLint,
+            ctypes.POINTER(ctypes.c_ssize_t),
+        )(query_address)
+
+        egl_cuda_device_nv = 0x323A
+        matches: list[int] = []
+        for egl_index, device in enumerate(egl_context.EGL.eglQueryDevicesEXT()):
+            value = ctypes.c_ssize_t(-1)
+            succeeded = query_device_attribute(device, egl_cuda_device_nv, ctypes.byref(value))
+            EGL.eglGetError()  # Clear EGL_BAD_ATTRIBUTE for non-CUDA EGL devices.
+            if succeeded and value.value == cuda_ordinal:
+                matches.append(egl_index)
+
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"expected one EGL device for CUDA ordinal {cuda_ordinal}, found EGL indices {matches}"
+            )
+        os.environ["MUJOCO_EGL_DEVICE_ID"] = str(matches[0])
+    except Exception as exc:
+        raise RuntimeError(f"Could not align EGL rendering with the visible CUDA device: {exc}") from exc
 
 
 def _get_suite(name: str) -> benchmark.Benchmark:
@@ -256,6 +319,7 @@ class LiberoEnv(gym.Env):
         """
         if self._env is not None:
             return
+        _configure_egl_device_for_visible_cuda()
         env = OffScreenRenderEnv(
             bddl_file_name=self._task_bddl_file,
             camera_heights=self.observation_height,

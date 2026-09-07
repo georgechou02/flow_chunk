@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# D4RL 小样本 QC-IFQL（best-of-n + 速度场 JVP 高阶约束）
+# D4RL 小样本 QC（best-of-n flow actor + 速度场 JVP 高阶约束）。
+# 论文 QC，不是 QC-FQL，也不是 QC-IFQL。文件名 run_qc_ifql_d4rl.sh 是历史命名。
 # 环境和 subsample ratio 对齐 fql-master/run_ifql_d4rl.sh。
 # 用法（在 d4rl conda 环境里）：
 #   conda activate d4rl
@@ -47,9 +48,9 @@ ENV_NAMES=(
     # "relocate-expert-v1"
 )
 
-# IFQL 脚本里的 lambda_flow_k；QC 没有 critic grad_weights。
+# lambda 扫描对齐 fql-master 的 kinematic 实验；QC 没有 critic grad_weights。
 LAMBDA_FLOW_KS=(0.1 0.5 1)
-# 默认只跑前向差分，对齐 IFQL actor 的 a' - a。需要 DCT 时加上 dct。
+# 默认只跑前向差分，对齐 flow actor 的 a' - a。需要 DCT 时加上 dct。
 DERIV_MODES=(forward dct)
 SEEDS=(0 1 2)
 
@@ -58,6 +59,7 @@ OFFLINE_STEPS=1000000
 ONLINE_STEPS=0
 EVAL_INTERVAL=100000
 EVAL_EPISODES=50
+# wandb 前缀是历史命名（内容是 QC / best-of-n，不是论文 QC-IFQL）。
 RUN_GROUP_PREFIX="qc_ifql_d4rl"
 PROJECT="QC_IFQL-Locomotion"
 
@@ -155,7 +157,7 @@ env_extra_args() {
 
 counter=0
 total=$((${#ENV_NAMES[@]} * ${#LAMBDA_FLOW_KS[@]} * ${#DERIV_MODES[@]} * ${#SEEDS[@]}))
-echo "Planning ${total} QC-IFQL D4RL jobs on GPUs ${GPUS[*]} (${JOBS_PER_GPU} per GPU)."
+echo "Planning ${total} QC D4RL jobs on GPUs ${GPUS[*]} (${JOBS_PER_GPU} per GPU)."
 
 for ENV_NAME in "${ENV_NAMES[@]}"; do
   RATIO="$(d4rl_ratio "${ENV_NAME}")"
@@ -207,6 +209,6 @@ for ENV_NAME in "${ENV_NAMES[@]}"; do
 done
 
 wait
-echo "All ${counter} QC-IFQL D4RL jobs completed."
+echo "All ${counter} QC D4RL jobs completed."
 
 # nohup bash run_qc_ifql_d4rl.sh > logs/run_qc_ifql_d4rl.log 2>&1 &

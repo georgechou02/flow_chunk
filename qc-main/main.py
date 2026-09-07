@@ -23,7 +23,7 @@ if 'CUDA_VISIBLE_DEVICES' in os.environ:
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string('run_group', 'Debug', 'Run group.')
-flags.DEFINE_string('project', 'Q-chunking', 'WandB project.')
+flags.DEFINE_string('project', 'Q-chunking-v3', 'WandB project.')
 flags.DEFINE_integer('seed', 0, 'Random seed.')
 flags.DEFINE_string('env_name', 'cube-triple-play-singletask-task2-v0', 'Environment (dataset) name.')
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')

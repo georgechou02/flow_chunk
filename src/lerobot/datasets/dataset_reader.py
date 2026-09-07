@@ -29,6 +29,7 @@ from lerobot.configs import (
 )
 
 from .dataset_metadata import LeRobotDatasetMetadata
+from .decoded_image_cache import DecodedImageCache
 from .depth_utils import MM_PER_METRE, dequantize_depth
 from .feature_utils import (
     check_delta_timestamps,
@@ -59,6 +60,7 @@ class DatasetReader:
         image_transforms: Callable | None,
         return_uint8: bool = False,
         depth_output_unit: str = DEFAULT_DEPTH_UNIT,
+        decoded_image_cache_root: str | Path | None = None,
     ):
         """Initialize the reader with metadata, filtering, and transform config.
 
@@ -80,6 +82,9 @@ class DatasetReader:
                 instead of normalized float32.
             depth_output_unit: Physical unit depth maps are dequantized to
                 (``"m"`` or ``"mm"``). Defaults to ``"mm"``.
+            decoded_image_cache_root: Optional lossless uint8 mmap cache for
+                image-backed RGB observations. ``None`` preserves the existing
+                Parquet/PIL decoding path exactly.
         """
         self._meta = meta
         self.root = root
@@ -91,8 +96,14 @@ class DatasetReader:
         self._image_transforms = image_transforms
         self._return_uint8 = return_uint8
         self._depth_output_unit = depth_output_unit
+        self._decoded_image_cache = (
+            DecodedImageCache(decoded_image_cache_root, meta)
+            if decoded_image_cache_root is not None
+            else None
+        )
 
         self.hf_dataset: datasets.Dataset | None = None
+        self._hf_read_dataset: datasets.Dataset | None = None
         self._absolute_to_relative_idx: dict[int, int] | None = None
 
         # Setup delta_indices (doesn't depend on hf_dataset)
@@ -132,14 +143,33 @@ class DatasetReader:
             return False
         if not self._check_cached_episodes_sufficient():
             self.hf_dataset = None
+            self._hf_read_dataset = None
             return False
         self._build_index_mapping()
+        self._build_read_dataset()
         return True
 
     def load_and_activate(self) -> None:
         """Load HF dataset from disk and build index mapping. Call after data is on disk."""
         self.hf_dataset = self._load_hf_dataset()
         self._build_index_mapping()
+        self._build_read_dataset()
+
+    def _build_read_dataset(self) -> None:
+        """Create the view used by get_item without materializing cached images.
+
+        Keeping ``hf_dataset`` intact preserves the public/raw dataset behavior.
+        The image-free view is only used when a decoded cache was explicitly
+        requested, so the default training path remains byte-for-byte unchanged.
+        """
+        if self.hf_dataset is None:
+            self._hf_read_dataset = None
+            return
+        if self._decoded_image_cache is None:
+            self._hf_read_dataset = self.hf_dataset
+            return
+        self._hf_read_dataset = self.hf_dataset.remove_columns(list(self._decoded_image_cache.keys))
+        self._hf_read_dataset.set_transform(hf_transform_to_torch)
 
     def _build_index_mapping(self) -> None:
         """Build absolute-to-relative index mapping from loaded hf_dataset."""
@@ -252,9 +282,14 @@ class DatasetReader:
 
     def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
         """Query dataset for indices across keys, skipping video keys."""
+        if self._hf_read_dataset is None:
+            raise RuntimeError("Dataset reader has not been activated.")
         result: dict = {}
         for key, q_idx in query_indices.items():
             if key in self._meta.video_keys:
+                continue
+            if self._decoded_image_cache is not None and key in self._decoded_image_cache:
+                result[key] = self._decoded_image_cache.get_float32(key, q_idx)
                 continue
             relative_indices = (
                 q_idx
@@ -262,9 +297,9 @@ class DatasetReader:
                 else [self._absolute_to_relative_idx[idx] for idx in q_idx]
             )
             try:
-                result[key] = torch.stack(self.hf_dataset[key][relative_indices])
+                result[key] = torch.stack(self._hf_read_dataset[key][relative_indices])
             except (KeyError, TypeError, IndexError):
-                result[key] = torch.stack(self.hf_dataset[relative_indices][key])
+                result[key] = torch.stack(self._hf_read_dataset[relative_indices][key])
         return result
 
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
@@ -316,7 +351,9 @@ class DatasetReader:
         HF dataset, **not** the absolute frame index stored in the ``index``
         column.  The absolute index is retrieved from the row itself.
         """
-        item = self.hf_dataset[idx]
+        if self._hf_read_dataset is None:
+            raise RuntimeError("Dataset reader has not been activated.")
+        item = self._hf_read_dataset[idx]
         ep_idx = item["episode_index"].item()
         abs_idx = item["index"].item()
 
@@ -327,6 +364,12 @@ class DatasetReader:
             item = {**item, **padding}
             for key, val in query_result.items():
                 item[key] = val
+
+        if self._decoded_image_cache is not None:
+            queried_keys = set(query_indices or {})
+            for key in self._decoded_image_cache.keys:
+                if key not in queried_keys:
+                    item[key] = self._decoded_image_cache.get_float32(key, [abs_idx]).squeeze(0)
 
         if len(self._meta.video_keys) > 0:
             current_ts = item["timestamp"].item()

@@ -1,4 +1,5 @@
 import copy
+import math
 from typing import Any
 
 import flax
@@ -7,7 +8,7 @@ import jax.numpy as jnp
 import ml_collections
 import optax
 
-from utils.action_derivatives import action_dot
+from utils.action_derivatives import action_dot, mixes_frames, physical_action_dot, resolve_kind
 from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import ActorVectorField, Value
@@ -67,14 +68,32 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         return actions, next_actions
 
     def _state_dot(self, batch, fps):
-        """Forward-difference state tangent at the current observation."""
+        """State tangent at the current observation (DiT ``conditioning_derivative_mode``).
+
+        Retain QC's central ``(s_{t+1} - s_{t-1}) * fps / 2`` default. Forward uses ``next_observations``;
+        reverse / central also need ``prev_observations``.
+        """
         observations = batch["observations"]
         next_observations = batch["next_observations"]
         if next_observations.ndim == observations.ndim + 1:
             next_obs0 = next_observations[:, 0]
         else:
             next_obs0 = next_observations
-        return (next_obs0 - observations) * jnp.asarray(fps, dtype=observations.dtype)
+        fps = jnp.asarray(fps, dtype=observations.dtype)
+        mode = self.config.get("state_derivative_mode", "central")
+        if mode == "forward":
+            return (next_obs0 - observations) * fps
+        if "prev_observations" not in batch:
+            raise ValueError(f"{mode} state derivatives require prev_observations in the batch")
+        prev_observations = batch["prev_observations"]
+        if mode == "reverse":
+            return (observations - prev_observations) * fps
+        if mode == "central":
+            return (next_obs0 - prev_observations) * (fps * jnp.asarray(0.5, dtype=observations.dtype))
+        raise ValueError(
+            "state_derivative_mode must be 'reverse', 'forward', or 'central', "
+            f"got {mode!r}"
+        )
 
     def _kinematic_valid_mask(self, batch, num_steps):
         """Per-step mask for kinematic supervision."""
@@ -86,11 +105,20 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             batch_size = batch["actions"].shape[0]
             kinematic_valid = jnp.ones((batch_size, num_steps), dtype=jnp.float32)
 
-        # DCT couples every frame in the chunk, so drop samples that cross an
-        # episode boundary rather than differentiating a mixed trajectory.
-        if self.config["dct_coe_num"] > 0:
+        # Every estimator except forward differences couples multiple frames, so
+        # drop samples that cross an episode boundary rather than differentiating
+        # a mixed trajectory. Savitzky-Golay only couples within its window, but
+        # the chunk-wide mask is a cheap over-approximation at these horizons.
+        if mixes_frames(self.config["derivative_kind"], self.config["dct_coe_num"]):
             all_valid = jnp.all(kinematic_valid > 0, axis=-1, keepdims=True)
             kinematic_valid = kinematic_valid * all_valid.astype(kinematic_valid.dtype)
+        if (
+            self.config.get("state_derivative_mode", "central") != "forward"
+            and "prev_valid" in batch
+        ):
+            kinematic_valid = kinematic_valid * batch["prev_valid"][:, None].astype(
+                kinematic_valid.dtype
+            )
         return kinematic_valid
 
     def _flow_actions(self, observations, noises, params=None, clip=True):
@@ -117,11 +145,11 @@ class ACFQLAgent(flax.struct.PyTreeNode):
     def _compute_kinematic_loss(self, batch, x_t, t, grad_params):
         """High-order constraint on the interpolant vector field ``v_θ(s, x_t, t)``.
 
-        Matches IFQL actor and multi-task DiT: JVP of the flow velocity on
+        Matches QC's flow actor and multi-task DiT: JVP of the flow velocity on
         ``x_t = (1-t)z + t a``, not of the Euler-integrated policy. ``ȧ`` is the
-        chunk derivative of the expert actions (forward difference or DCT).
-        Residual is ``v_s_dot - ȧ``, or DiT's ``(1-t)(v_s_dot + t·v_a_k_dot - ȧ)``
-        when ``use_jvp_ak`` is set.
+        chunk derivative of the expert actions (see ``utils.action_derivatives``).
+        Residual is always ``(1-t)(v_s_dot + t·v_a_k_dot - ȧ)``,
+        matching the current LeRobot main algorithm.
         """
         fps = self.config["sample_frequency"]
         actions, next_actions = self._action_chunk(batch)
@@ -130,6 +158,16 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             next_actions=next_actions,
             fps=fps,
             dct_coe_num=self.config["dct_coe_num"],
+            kind=self.config["derivative_kind"],
+            savgol_window=self.config["savgol_window"],
+            savgol_polyorder=self.config["savgol_polyorder"],
+            bspline_num_control_points=(
+                self.config.get("bspline_coe_num", 0)
+                or self.config["bspline_num_control_points"]
+                or None
+            ),
+            bspline_degree=self.config["bspline_degree"],
+            chebyshev_num_modes=self.config["chebyshev_num_modes"] or None,
         )
         a_dot_flat = jnp.reshape(a_dot, (a_dot.shape[0], -1))
         s_dot = self._state_dot(batch, fps)
@@ -140,22 +178,24 @@ class ACFQLAgent(flax.struct.PyTreeNode):
 
         pred, v_s_dot = jax.jvp(flow_vector_field_obs, (observations,), (s_dot,))
 
-        v_a_k_dot = jnp.zeros_like(v_s_dot)
-        if self.config["use_jvp_ak"]:
+        def flow_vector_field_action(actions_t):
+            return self.network.select("actor_bc_flow")(
+                observations, actions_t, t, params=grad_params
+            )
 
-            def flow_vector_field_action(actions_t):
-                return self.network.select("actor_bc_flow")(
-                    observations, actions_t, t, params=grad_params
-                )
-
-            _, v_a_k_dot = jax.jvp(flow_vector_field_action, (x_t,), (a_dot_flat,))
-            if self.config["stop_gradient_jvp_ak"]:
-                v_a_k_dot = jax.lax.stop_gradient(v_a_k_dot)
-            residual = (1.0 - t) * (v_s_dot + t * v_a_k_dot - a_dot_flat)
+        _, v_a_k_dot = jax.jvp(flow_vector_field_action, (x_t,), (a_dot_flat,))
+        action_jvp_grad_scale = self.config["action_jvp_grad_scale"]
+        if action_jvp_grad_scale == 0.0:
+            v_a_k_dot_for_loss = jax.lax.stop_gradient(v_a_k_dot)
+        elif action_jvp_grad_scale == 1.0:
+            v_a_k_dot_for_loss = v_a_k_dot
         else:
-            if self.config["use_1_k"]:
-                v_s_dot = (1.0 - t) * v_s_dot
-            residual = v_s_dot - a_dot_flat
+            detached = jax.lax.stop_gradient(v_a_k_dot)
+            v_a_k_dot_for_loss = detached + action_jvp_grad_scale * (v_a_k_dot - detached)
+        # Match LeRobot main: both JVPs are present in the forward residual.
+        # The time factor is applied BEFORE squaring; grad_scale only changes
+        # the direct kinematic gradient through the action-input JVP.
+        residual = (1.0 - t) * (v_s_dot + t * v_a_k_dot_for_loss - a_dot_flat)
 
         kinematic_valid = self._kinematic_valid_mask(batch, a_dot.shape[1])
         residual_chunk = jnp.reshape(residual, a_dot.shape)
@@ -170,12 +210,50 @@ class ACFQLAgent(flax.struct.PyTreeNode):
 
         info = {
             "kinematic_loss": kinematic_loss,
+            "kinematic_residual_time_weight_mean": (1.0 - t).mean(),
+            "kinematic_loss_time_weight_mean": jnp.square(1.0 - t).mean(),
+            "action_jvp_grad_scale": jnp.asarray(self.config["action_jvp_grad_scale"]),
             "kinematic_valid_ratio": kinematic_valid.mean(),
             "a_dot_rms": masked_rms(a_dot_flat),
             "kinematic_state_jvp_rms": masked_rms(v_s_dot),
             "kinematic_action_jvp_rms": masked_rms(v_a_k_dot),
         }
         return pred, kinematic_loss, info
+
+    def _flow_error_chunk(self, flow_error):
+        """Reshape a flattened flow error into ``(B, H, A)``."""
+        if self.config["action_chunking"]:
+            return jnp.reshape(
+                flow_error,
+                (flow_error.shape[0], self.config["horizon_length"], self.config["action_dim"]),
+            )
+        return flow_error[:, None, :]
+
+    def _compute_physical_loss(self, batch, flow_error, t):
+        """Value-level residual ``t(1-t) g(v_θ - (a - z))`` on the action chunk."""
+        error_chunk = self._flow_error_chunk(flow_error)
+        g_flow_error = physical_action_dot(
+            error_chunk,
+            fps=self.config["sample_frequency"],
+            dct_coe_num=self.config["dct_coe_num"],
+            kind=self.config["derivative_kind"],
+            savgol_window=self.config["savgol_window"],
+            savgol_polyorder=self.config["savgol_polyorder"],
+            bspline_num_control_points=(
+                self.config.get("bspline_coe_num", 0)
+                or self.config["bspline_num_control_points"]
+                or None
+            ),
+            bspline_degree=self.config["bspline_degree"],
+            chebyshev_num_modes=self.config["chebyshev_num_modes"] or None,
+        )
+        t_expanded = t[:, :, None]
+        physical_residual = t_expanded * (1.0 - t_expanded) * g_flow_error
+        physical_valid = self._kinematic_valid_mask(batch, error_chunk.shape[1])
+        per_step = jnp.mean(jnp.square(physical_residual), axis=-1)
+        num_valid = jnp.maximum(physical_valid.sum(), jnp.asarray(1.0, dtype=per_step.dtype))
+        physical_loss = (per_step * physical_valid).sum() / num_valid
+        return physical_loss
 
     def actor_loss(self, batch, grad_params, rng):
         """Compute the FQL actor loss."""
@@ -220,6 +298,16 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         else:
             bc_flow_loss = jnp.mean(jnp.square(pred - vel))
 
+        phy_loss_weight = float(self.config.get("phy_loss_weight", 0.0))
+        flow_error = pred - vel
+        physical_flow_error = flow_error if phy_loss_weight > 0 else jax.lax.stop_gradient(flow_error)
+        physical_loss = self._compute_physical_loss(batch, physical_flow_error, t)
+        weighted_physical_loss = (
+            phy_loss_weight * physical_loss
+            if phy_loss_weight > 0
+            else jnp.zeros((), dtype=pred.dtype)
+        )
+
         if self.config["actor_type"] == "distill-ddpg":
             # Distillation loss.
             rng, noise_rng = jax.random.split(rng)
@@ -242,6 +330,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         actor_loss = (
             bc_flow_loss
             + lambda_flow_k * kinematic_loss
+            + weighted_physical_loss
             + self.config['alpha'] * distill_loss
             + q_loss
         )
@@ -251,6 +340,9 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             'bc_flow_loss': bc_flow_loss,
             'distill_loss': distill_loss,
             'lambda_flow_k': jnp.asarray(lambda_flow_k, dtype=actor_loss.dtype),
+            'physical_loss': physical_loss,
+            'phy_loss_weight': jnp.asarray(phy_loss_weight, dtype=actor_loss.dtype),
+            'weighted_physical_loss': weighted_physical_loss,
         }
         info.update(kinematic_info)
         return actor_loss, info
@@ -450,6 +542,17 @@ class ACFQLAgent(flax.struct.PyTreeNode):
 
         if config["lambda_flow_k"] < 0:
             raise ValueError(f"lambda_flow_k must be >= 0, got {config['lambda_flow_k']}")
+        action_jvp_grad_scale = float(config["action_jvp_grad_scale"])
+        if not math.isfinite(action_jvp_grad_scale) or not 0.0 <= action_jvp_grad_scale <= 1.0:
+            raise ValueError("action_jvp_grad_scale must be finite and in [0, 1]")
+        phy_loss_weight = float(config.get("phy_loss_weight", 0.0))
+        if not math.isfinite(phy_loss_weight) or phy_loss_weight < 0:
+            raise ValueError(f"phy_loss_weight must be finite and >= 0, got {phy_loss_weight}")
+        if config.get("state_derivative_mode", "central") not in {"reverse", "forward", "central"}:
+            raise ValueError(
+                "state_derivative_mode must be 'reverse', 'forward', or 'central', "
+                f"got {config.get('state_derivative_mode')!r}"
+            )
         if config["sample_frequency"] <= 0:
             raise ValueError(f"sample_frequency must be > 0, got {config['sample_frequency']}")
         if config["dct_coe_num"] < 0:
@@ -459,6 +562,51 @@ class ACFQLAgent(flax.struct.PyTreeNode):
                 f"dct_coe_num must be in [0, horizon_length] "
                 f"(got {config['dct_coe_num']} for horizon_length={config['horizon_length']})"
             )
+
+        # Fail here rather than inside the jitted loss, where the traceback would
+        # point at the stencil construction instead of the offending config.
+        derivative_kind = resolve_kind(config["derivative_kind"], config["dct_coe_num"])
+        chunk_length = config["horizon_length"] if config["action_chunking"] else 1
+        if derivative_kind == "savgol":
+            if config["savgol_polyorder"] < 1:
+                raise ValueError(
+                    f"savgol_polyorder must be >= 1, got {config['savgol_polyorder']}"
+                )
+            if config["savgol_window"] <= config["savgol_polyorder"]:
+                raise ValueError(
+                    f"savgol_window must exceed savgol_polyorder, got "
+                    f"{config['savgol_window']} <= {config['savgol_polyorder']}"
+                )
+            if config["savgol_window"] > chunk_length:
+                raise ValueError(
+                    f"savgol_window must be <= chunk length {chunk_length}, "
+                    f"got {config['savgol_window']}"
+                )
+        elif derivative_kind == "bspline":
+            if chunk_length < 2:
+                raise ValueError("bspline derivatives require a chunk length of at least 2")
+            if config["bspline_degree"] < 2:
+                raise ValueError(
+                    f"bspline_degree must be >= 2, got {config['bspline_degree']}"
+                )
+            num_control_points = (
+                config.get("bspline_coe_num", 0)
+                or config["bspline_num_control_points"]
+                or chunk_length
+            )
+            if not config["bspline_degree"] < num_control_points <= chunk_length:
+                raise ValueError(
+                    "bspline requires 2 <= bspline_degree < M <= chunk length "
+                    f"(got p={config['bspline_degree']}, M={num_control_points}, H={chunk_length})"
+                )
+        elif derivative_kind == "chebyshev":
+            if chunk_length < 2:
+                raise ValueError("chebyshev derivatives require a chunk length of at least 2")
+            num_modes = config["chebyshev_num_modes"] or chunk_length
+            if not 1 <= num_modes <= chunk_length:
+                raise ValueError(
+                    f"chebyshev_num_modes must be in [1, {chunk_length}], got {num_modes}"
+                )
 
         return cls(rng, network=network, config=flax.core.FrozenDict(**config))
 
@@ -492,11 +640,21 @@ def get_config():
             fourier_feature_dim=64,
             weight_decay=0.,
             lambda_flow_k=0.0,  # Weight for high-order / kinematic JVP loss (0 disables it).
+            phy_loss_weight=0.0,  # Weight for the value-level physical residual loss.
             dct_coe_num=0,  # 0: forward-difference a_dot; >0: truncated DCT a_dot.
-            use_jvp_ak=False,  # Add action-input JVP term to the kinematic residual.
-            stop_gradient_jvp_ak=False,  # Stop gradients through the action-input JVP.
-            use_1_k=False,  # Scale the state JVP by (1 - t) when use_jvp_ak is disabled.
+            # a_dot estimator: "auto" defers to dct_coe_num, or force one of
+            # "forward" / "dct" / "savgol" / "bspline" / "chebyshev".
+            derivative_kind="auto",
+            savgol_window=5,  # Samples per local polynomial fit.
+            savgol_polyorder=2,  # Local polynomial degree; must be < savgol_window.
+            bspline_num_control_points=0,  # 0: M = chunk length (full fit, like DiT M=H).
+            bspline_coe_num=0,  # v2 name for M; if set, overrides bspline_num_control_points.
+            bspline_degree=2,  # Quadratic by default (DiT training script). Requires 2 <= p < M.
+            chebyshev_num_modes=0,  # 0: keep all H Chebyshev modes.
+            action_jvp_grad_scale=1.0,  # Full action-JVP gradient, matching LeRobot main.
             sample_frequency=1.0,  # Control frequency in Hz for action/state derivatives.
+            # State tangent at the chunk start; retain the QC derivative default.
+            state_derivative_mode="central",
         )
     )
     return config

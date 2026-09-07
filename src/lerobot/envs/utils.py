@@ -65,11 +65,15 @@ def _convert_nested_dict(d):
     return result
 
 
-def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Tensor]:
+def preprocess_observation(
+    observations: dict[str, np.ndarray], *, image_device: torch.device | str | None = None
+) -> dict[str, Tensor]:
     # TODO(jadechoghari, imstevenpmwork): refactor this to use features from the environment (no hardcoding)
     """Convert environment observation to LeRobot format observation.
     Args:
         observation: Dictionary of observation batches from a Gym vector environment.
+        image_device: Optional device for image layout conversion and uint8-to-float scaling.
+            Moving uint8 images first reduces host-to-device traffic by four times.
     Returns:
         Dictionary of observation batches with keys renamed to LeRobot format and values as tensors.
     """
@@ -96,10 +100,19 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
             # sanity check that images are uint8
             assert img_tensor.dtype == torch.uint8, f"expect torch.uint8, but instead {img_tensor.dtype=}"
 
+            if image_device is not None:
+                img_tensor = img_tensor.to(image_device)
+
             # convert to channel first of type float32 in range [0,1]
             img_tensor = einops.rearrange(img_tensor, "b h w c -> b c h w").contiguous()
-            img_tensor = img_tensor.type(torch.float32)
-            img_tensor /= 255
+            if img_tensor.device.type == "cuda":
+                # CUDA float32 division uses a reciprocal and differs from the
+                # CPU reference by one ULP for some uint8 values. Double
+                # division followed by a float cast preserves all 256 values.
+                img_tensor = (img_tensor.to(torch.float64) / 255).to(torch.float32)
+            else:
+                img_tensor = img_tensor.type(torch.float32)
+                img_tensor /= 255
 
             return_observations[imgkey] = img_tensor
 
@@ -193,8 +206,12 @@ class _LazyAsyncVectorEnv:
         observation_space=None,
         action_space=None,
         metadata=None,
+        static_attributes: Mapping[str, Sequence[Any]] | None = None,
     ):
         self._env_fns = env_fns
+        self._static_attributes = {key: tuple(value) for key, value in (static_attributes or {}).items()}
+        if any(len(value) != len(env_fns) for value in self._static_attributes.values()):
+            raise ValueError("Static attributes must contain one value per environment.")
         self._env: gym.vector.AsyncVectorEnv | None = None
         self.num_envs = len(env_fns)
         if observation_space is not None and action_space is not None and metadata is not None:
@@ -227,6 +244,8 @@ class _LazyAsyncVectorEnv:
         return self._env.step(actions)
 
     def call(self, name, *args, **kwargs):
+        if not args and not kwargs and name in self._static_attributes:
+            return self._static_attributes[name]
         self._ensure()
         return self._env.call(name, *args, **kwargs)
 

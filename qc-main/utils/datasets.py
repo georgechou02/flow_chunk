@@ -109,6 +109,12 @@ class Dataset(FrozenDict):
         # Calculate next_actions
         next_action_idxs = np.minimum(all_idxs + 1, self.size - 1)
         batch_next_actions = self['actions'][next_action_idxs].reshape(batch_size, sequence_length, *self['actions'].shape[1:])
+
+        # Previous observation for reverse / central ṡ at the chunk start.
+        prev_idxs = np.maximum(idxs - 1, 0)
+        prev_observations = self['observations'][prev_idxs]
+        terminals_flat = np.asarray(self['terminals']).reshape(self.size, -1)[:, 0]
+        prev_valid = ((idxs > 0) & (terminals_flat[prev_idxs] < 0.5)).astype(np.float32)
         
         # Use vectorized operations to calculate cumulative rewards and masks
         rewards = np.zeros((batch_size, sequence_length), dtype=float)
@@ -143,6 +149,8 @@ class Dataset(FrozenDict):
         
         return dict(
             observations=data['observations'].copy(),
+            prev_observations=prev_observations,
+            prev_valid=prev_valid,
             full_observations=observations,
             actions=actions,
             masks=masks,

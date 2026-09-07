@@ -40,6 +40,9 @@ class DatasetConfig:
     # When True, RGB video frames are returned as uint8 tensors (0-255) instead of float32 (0.0-1.0).
     # This reduces memory and speeds up DataLoader IPC. The training pipeline handles the conversion.
     return_uint8: bool = False
+    # Optional lossless uint8 mmap cache for image-backed observations. When unset, the existing
+    # Parquet/PIL path is used unchanged. The cache must be built explicitly and match this dataset.
+    decoded_image_cache_root: str | None = None
     # Physical unit depth maps are dequantized to at load time: "mm" (millimeters) or "m" (metres).
     # Has no effect on datasets without depth cameras.
     depth_output_unit: str = DEFAULT_DEPTH_UNIT
@@ -74,6 +77,9 @@ class WandBConfig:
     notes: str | None = None
     group: str | None = None
     tags: list[str] = field(default_factory=list)
+    # Optional, filterable training-data label. When omitted, the W&B logger
+    # infers full/lowdata1/lowdata10 for LIBERO runs where possible.
+    data_regime: str | None = None
     run_id: str | None = None
     mode: str | None = None  # Allowed values: 'online', 'offline' 'disabled'. Defaults to 'online'
     add_tags: bool = True  # If True, save configuration as tags in the WandB run.
@@ -82,12 +88,18 @@ class WandBConfig:
 @dataclass
 class EvalConfig:
     n_episodes: int = 50
+    # Maximum number of rendered rollout videos to save per task. Set to 0 for
+    # large benchmarks where rendering every task would be prohibitively large.
+    max_episodes_rendered: int = 10
     # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.
     # Set to 0 for auto-tuning based on available CPU cores and n_episodes.
     batch_size: int = 0
     # `use_async_envs` specifies whether to use asynchronous environments (multiprocessing).
     # Defaults to True; automatically downgraded to SyncVectorEnv when batch_size=1.
     use_async_envs: bool = True
+    # Convert raw uint8 camera images on the policy device with the same rounding
+    # as CPU preprocessing. Opt in independently of the evaluation protocol.
+    fast_image_preprocessing: bool = False
     # Whether to record eval rollouts as a LeRobot dataset on disk.
     recording: bool = False
     # If set, push recorded eval datasets to the Hub under this repo id (one repo per task,
@@ -97,6 +109,8 @@ class EvalConfig:
     recording_private: bool = False
 
     def __post_init__(self) -> None:
+        if self.max_episodes_rendered < 0:
+            raise ValueError("eval.max_episodes_rendered must be non-negative.")
         if self.recording_repo_id is not None and not self.recording:
             raise ValueError("eval.recording_repo_id requires eval.recording=true.")
         if self.batch_size == 0:

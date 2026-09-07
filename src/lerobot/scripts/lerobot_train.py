@@ -70,6 +70,27 @@ from lerobot.utils.utils import (
 
 from .lerobot_eval import eval_policy_all
 
+_PER_STEP_PHYSICAL_METRICS = ("physical_loss", "weighted_physical_loss")
+_PER_STEP_CLEAN_ACTION_METRICS = ("clean_action_mse", "clean_action_valid_ratio")
+
+
+def _log_per_step_physical_metrics(
+    wandb_logger: WandBLogger | None,
+    output_dict: dict | None,
+    step: int,
+    is_log_step: bool,
+) -> None:
+    """Log sparse policy metrics between regular log steps without duplicating log-step entries."""
+    if wandb_logger is None or is_log_step or not output_dict:
+        return
+    per_step_metrics = {
+        key: output_dict[key]
+        for key in _PER_STEP_PHYSICAL_METRICS + _PER_STEP_CLEAN_ACTION_METRICS
+        if key in output_dict
+    }
+    if per_step_metrics:
+        wandb_logger.log_dict(per_step_metrics, step)
+
 
 def update_policy(
     train_metrics: MetricsTracker,
@@ -148,13 +169,16 @@ def update_policy(
     # Use accelerator's backward method
     accelerator.backward(loss)
 
-    # Clip gradients if specified
-    if grad_clip_norm > 0:
-        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
-    else:
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            policy.parameters(), float("inf"), error_if_nonfinite=False
-        )
+    grad_norm = None
+    if accelerator.sync_gradients:
+        # Clip only after the final accumulated micro-batch, when Accelerate
+        # has unscaled and synchronized the gradients.
+        if grad_clip_norm > 0:
+            grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                policy.parameters(), float("inf"), error_if_nonfinite=False
+            )
 
     # Optimizer step
     with lock if lock is not None else nullcontext():
@@ -162,17 +186,19 @@ def update_policy(
 
     optimizer.zero_grad()
 
-    # Step through pytorch scheduler at every batch instead of epoch
-    if lr_scheduler is not None:
+    # Step scheduler and policy buffers once per optimizer update, not once per
+    # accumulated micro-batch.
+    if lr_scheduler is not None and accelerator.sync_gradients:
         lr_scheduler.step()
 
     # Update internal buffers if policy has update method
-    if has_method(unwrapped_policy, "update"):
+    if accelerator.sync_gradients and has_method(unwrapped_policy, "update"):
         unwrapped_policy.update()
 
     train_metrics.loss = loss.item()
-    train_metrics.grad_norm = grad_norm.item()
-    train_metrics.lr = optimizer.param_groups[0]["lr"]
+    if grad_norm is not None:
+        train_metrics.grad_norm = grad_norm.item()
+        train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
     if torch.cuda.is_available():
         train_metrics.gpu_mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
@@ -222,6 +248,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
             mixed_precision=mixed_precision,
+            gradient_accumulation_steps=cfg.gradient_accumulation_steps,
             kwargs_handlers=[ddp_kwargs],
             cpu=force_cpu,
         )
@@ -369,6 +396,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
+    configured_group_lrs = [float(group["lr"]) for group in optimizer.param_groups]
 
     # Create sample weighter if configured (e.g., for RA-BC training)
     sample_weighter = None
@@ -391,9 +419,42 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         # Under FSDP the optimizer state is sharded and must be loaded after `accelerator.prepare()`
         # (see load_fsdp_optimizer_state below), so skip the optimizer here and load it then.
         is_fsdp = accelerator.distributed_type == DistributedType.FSDP
-        step, optimizer, lr_scheduler = load_training_state(
-            cfg.checkpoint_path, optimizer, lr_scheduler, load_optimizer=not is_fsdp
+        if is_fsdp and cfg.restart_scheduler_on_resume:
+            raise NotImplementedError(
+                "restart_scheduler_on_resume is not yet supported with FSDP; "
+                "the LIBERO late-branch experiments use single-GPU resume."
+            )
+        scheduler_to_restore = None if cfg.restart_scheduler_on_resume else lr_scheduler
+        step, optimizer, restored_scheduler = load_training_state(
+            cfg.checkpoint_path, optimizer, scheduler_to_restore, load_optimizer=not is_fsdp
         )
+        if cfg.restart_scheduler_on_resume:
+            if cfg.scheduler is None:
+                raise ValueError("Cannot restart a missing LR scheduler")
+            remaining_steps = cfg.steps - step
+            if remaining_steps <= 0:
+                raise ValueError(
+                    f"Scheduler restart requires cfg.steps > resumed step, got {cfg.steps} <= {step}"
+                )
+            peak_lr = float(cfg.restart_scheduler_peak_lr)
+            configured_peak_lr = max(configured_group_lrs)
+            if configured_peak_lr <= 0:
+                raise ValueError("Scheduler restart requires a positive configured optimizer LR")
+            lr_scale = peak_lr / configured_peak_lr
+            restarted_group_lrs = [lr * lr_scale for lr in configured_group_lrs]
+            for group, restarted_lr in zip(optimizer.param_groups, restarted_group_lrs, strict=True):
+                group["lr"] = restarted_lr
+                group["initial_lr"] = restarted_lr
+            lr_scheduler = cfg.scheduler.build(optimizer, remaining_steps)
+            if is_main_process:
+                logging.info(
+                    "Restarted LR scheduler at step %d for %d remaining steps with group LRs %s",
+                    step,
+                    remaining_steps,
+                    restarted_group_lrs,
+                )
+        else:
+            lr_scheduler = restored_scheduler
 
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
@@ -410,8 +471,14 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
         logging.info(f"{dataset.num_episodes=}")
         num_processes = accelerator.num_processes
-        effective_bs = cfg.batch_size * num_processes
-        logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
+        effective_bs = cfg.batch_size * num_processes * cfg.gradient_accumulation_steps
+        logging.info(
+            "Effective batch size: %d x %d processes x %d accumulation = %d",
+            cfg.batch_size,
+            num_processes,
+            cfg.gradient_accumulation_steps,
+            effective_bs,
+        )
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
@@ -451,7 +518,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     f"batch_size={saved_batch_size}. The data order resumes at the right epoch/offset, "
                     "but per-rank sample-exactness requires the same batch size."
                 )
-            sampler_state = compute_sampler_state(step, len(sampler), ckpt_batch_size, ckpt_num_processes)
+            sampler_state = compute_sampler_state(
+                step,
+                len(sampler),
+                ckpt_batch_size * cfg.gradient_accumulation_steps,
+                ckpt_num_processes,
+            )
             sampler.load_state_dict(sampler_state)
             if is_main_process:
                 logging.info(
@@ -544,10 +616,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         # max() because headroom is gated by the worst-case rank.
         train_metrics["gpu_mem_gb"] = AverageMeter("mem_gb", ":.2f", reduction="max")
 
-    # Keep global batch size for logging; MetricsTracker handles world size internally.
-    effective_batch_size = cfg.batch_size * accelerator.num_processes
+    # MetricsTracker multiplies its batch size by world size, so include only
+    # the per-rank accumulation factor in the value passed to it.
+    effective_batch_size = cfg.batch_size * accelerator.num_processes * cfg.gradient_accumulation_steps
+    physical_global_batch_size = cfg.batch_size * accelerator.num_processes
     train_tracker = MetricsTracker(
-        cfg.batch_size,
+        cfg.batch_size * cfg.gradient_accumulation_steps,
         dataset.num_frames,
         dataset.num_episodes,
         train_metrics,
@@ -568,7 +642,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
-    for _ in range(step, cfg.steps):
+    while step < cfg.steps:
         start_time = time.perf_counter()
         batch = next(dl_iter)
         for cam_key in dataset.meta.camera_keys:
@@ -577,17 +651,21 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
-        train_tracker, output_dict = update_policy(
-            train_tracker,
-            policy,
-            batch,
-            optimizer,
-            cfg.optimizer.grad_clip_norm,
-            accelerator=accelerator,
-            lr_scheduler=lr_scheduler,
-            sample_weighter=sample_weighter,
-            step=step,
-        )
+        with accelerator.accumulate(policy):
+            train_tracker, output_dict = update_policy(
+                train_tracker,
+                policy,
+                batch,
+                optimizer,
+                cfg.optimizer.grad_clip_norm,
+                accelerator=accelerator,
+                lr_scheduler=lr_scheduler,
+                sample_weighter=sample_weighter,
+                step=step,
+            )
+
+        if not accelerator.sync_gradients:
+            continue
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
@@ -600,6 +678,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         is_env_eval_step = cfg.env_eval_freq > 0 and step % cfg.env_eval_freq == 0
         is_eval_step = cfg.eval_steps > 0 and eval_dataloader is not None and step % cfg.eval_steps == 0
 
+        # Physical metrics are required at every optimization step, while clean-action
+        # metrics are emitted only on their configured ODE-sampling steps. The regular
+        # logging path below already includes both on log steps; emit just these selected
+        # metrics between log steps without increasing every other statistic's frequency.
+        if is_main_process:
+            _log_per_step_physical_metrics(wandb_logger, output_dict, step, is_log_step)
+
         if is_log_step:
             # Collective reduce must run on every rank, before the main-process gate below.
             train_tracker.reduce_across_ranks()
@@ -608,7 +693,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 # reflects the slowest rank — which is what actually gates the next iteration.
                 step_time = train_tracker.update_s.avg + train_tracker.dataloading_s.avg
                 if step_time > 0:
-                    train_tracker.samples_per_s = effective_batch_size / step_time
+                    # Timings are averaged per micro-batch; use the physical
+                    # global batch to report real sample throughput.
+                    train_tracker.samples_per_s = physical_global_batch_size / step_time
                 logging.info(train_tracker)
                 if wandb_logger:
                     wandb_log_dict = train_tracker.to_dict()
@@ -686,6 +773,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             if is_main_process:
                 step_id = get_step_identifier(step, cfg.steps)
                 logging.info(f"Eval policy at step {step}")
+                videos_dir = None
+                if cfg.eval.max_episodes_rendered > 0:
+                    videos_dir = (
+                        cfg.env_eval_output_dir or cfg.output_dir / "eval"
+                    ) / f"videos_step_{step_id}"
                 with torch.no_grad(), accelerator.autocast():
                     eval_info = eval_policy_all(
                         envs=eval_env,  # dict[suite][task_id] -> vec_env
@@ -695,11 +787,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                         preprocessor=preprocessor,
                         postprocessor=postprocessor,
                         n_episodes=cfg.eval.n_episodes,
-                        videos_dir=(cfg.env_eval_output_dir or cfg.output_dir / "eval")
-                        / f"videos_step_{step_id}",
-                        max_episodes_rendered=4,
+                        videos_dir=videos_dir,
+                        max_episodes_rendered=cfg.eval.max_episodes_rendered,
                         start_seed=cfg.seed,
                         max_parallel_tasks=cfg.env.max_parallel_tasks,
+                        image_preprocessing_device=(
+                            accelerator.device if cfg.eval.fast_image_preprocessing else None
+                        ),
                     )
                 # overall metrics (suite-agnostic)
                 aggregated = eval_info["overall"]
@@ -728,7 +822,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 if wandb_logger:
                     wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
-                    wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+                    video_paths = eval_info["overall"].get("video_paths", [])
+                    if video_paths:
+                        wandb_logger.log_video(video_paths[0], step, mode="eval")
 
             accelerator.wait_for_everyone()
 

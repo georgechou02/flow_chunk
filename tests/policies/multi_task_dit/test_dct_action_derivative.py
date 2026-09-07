@@ -21,9 +21,13 @@ import pytest
 import torch
 from torch import Tensor, nn
 
+from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.policies.multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
-from lerobot.policies.multi_task_dit.modeling_multi_task_dit import FlowMatchingObjective
-from lerobot.utils.constants import ACTION
+from lerobot.policies.multi_task_dit.modeling_multi_task_dit import (
+    FlowMatchingObjective,
+    MultiTaskDiTPolicy,
+)
+from lerobot.utils.constants import ACTION, OBS_STATE
 
 
 def _make_objective(
@@ -35,17 +39,15 @@ def _make_objective(
     values = {
         "dct_coe_num": 0,
         "conditioning_derivative_mode": "reverse",
-        "enable_stochastic": False,
         "gripper_first": True,
         "image_only_condition_jvp": False,
         "lambda_flow_k": 1.0,
+        "phy_loss_weight": 0.0,
         "pre_train_steps": 0,
         "sample_frequency": 10.0,
         "sigma_min": 0.0,
-        "stop_gradient_jvp_ak": False,
+        "action_jvp_grad_scale": 1.0,
         "timestep_sampling_strategy": "uniform",
-        "use_1_k": False,
-        "use_jvp_ak": False,
     }
     values.update(overrides)
     return FlowMatchingObjective(
@@ -74,6 +76,107 @@ def _single_mode_actions(
     if batch_scales is not None:
         actions = actions * batch_scales[:, None, None]
     return actions
+
+
+@pytest.mark.parametrize("clean_action_log_freq", [-1, 1.5, True])
+def test_clean_action_log_frequency_rejects_invalid_values(clean_action_log_freq):
+    with pytest.raises(ValueError, match="clean_action_log_freq"):
+        MultiTaskDiTConfig(clean_action_log_freq=clean_action_log_freq)
+
+
+def test_clean_action_metrics_follow_cadence_and_restore_training_state(monkeypatch):
+    pytest.importorskip("diffusers", reason="MultiTaskDiTPolicy requires lerobot[multi_task_dit]")
+    config = MultiTaskDiTConfig(
+        device="cpu",
+        input_features={OBS_STATE: PolicyFeature(FeatureType.STATE, (3,))},
+        output_features={ACTION: PolicyFeature(FeatureType.ACTION, (2,))},
+        objective="flow_matching",
+        single_task=True,
+        vision_encoder_type="resnet",
+        image_crop_shape=None,
+        n_obs_steps=2,
+        horizon=4,
+        n_action_steps=2,
+        hidden_dim=8,
+        num_layers=1,
+        num_heads=1,
+        timestep_embed_dim=4,
+        dropout=0.0,
+        lambda_flow_k=0.0,
+        dct_coe_num=4,
+        num_integration_steps=1,
+        clean_action_log_freq=2,
+    )
+    policy = MultiTaskDiTPolicy(config).train()
+    policy.noise_predictor = TinyFlowModel(action_dim=2, conditioning_dim=6)
+    batch = {
+        OBS_STATE: torch.randn(2, 2, 3),
+        ACTION: torch.randn(2, 4, 2),
+        "action_is_pad": torch.zeros(2, 4, dtype=torch.bool),
+    }
+    batch["action_is_pad"][0, 1] = True
+    sampler_calls = 0
+
+    def fake_conditional_sample(model, batch_size, conditioning_vec, noise=None):
+        nonlocal sampler_calls
+        sampler_calls += 1
+        assert not policy.training
+        assert batch_size == 2
+        assert conditioning_vec.shape == (2, 6)
+        assert noise is not None
+        return batch[ACTION] + 3.0
+
+    monkeypatch.setattr(policy.objective, "conditional_sample", fake_conditional_sample)
+
+    policy.set_train_step(0)
+    _, first_metrics = policy(batch)
+    assert "clean_action_mse" not in first_metrics
+    assert sampler_calls == 0
+
+    policy.set_train_step(1)
+    _, second_metrics = policy(batch)
+    assert second_metrics["clean_action_mse"] == pytest.approx(9.0)
+    assert second_metrics["clean_action_valid_ratio"] == pytest.approx(3 / 4)
+    assert sampler_calls == 1
+    assert policy.training
+    assert policy.noise_predictor.training
+
+
+@pytest.mark.parametrize(
+    ("step", "expected"),
+    [
+        (15_999, 0.01),
+        (16_000, 0.01),
+        (17_000, 0.005 * (1 + math.sqrt(0.5))),
+        (18_000, 0.005),
+        (19_000, 0.005 * (1 - math.sqrt(0.5))),
+        (20_000, 0.0),
+    ],
+)
+def test_kinematic_weight_cosine_schedule(step: int, expected: float):
+    objective = _make_objective(
+        lambda_flow_k=0.01,
+        lambda_flow_k_schedule="cosine",
+        lambda_flow_k_schedule_start_step=16_000,
+        lambda_flow_k_schedule_end_step=20_000,
+        lambda_flow_k_schedule_final=0.0,
+    )
+
+    assert objective._effective_lambda_flow_k(step) == pytest.approx(expected)
+
+
+def test_kinematic_weight_schedule_supports_hard_switch_without_changing_configured_weight():
+    objective = _make_objective(
+        lambda_flow_k=0.01,
+        lambda_flow_k_schedule="cosine",
+        lambda_flow_k_schedule_start_step=16_000,
+        lambda_flow_k_schedule_end_step=16_000,
+        lambda_flow_k_schedule_final=0.0,
+    )
+
+    assert objective.config.lambda_flow_k == 0.01
+    assert objective._effective_lambda_flow_k(15_999) == 0.01
+    assert objective._effective_lambda_flow_k(16_000) == 0.0
 
 
 def _single_mode_derivative(
@@ -132,6 +235,16 @@ class RecordingFlowModel(TinyFlowModel):
         return super().forward(actions, timesteps, conditioning_vec)
 
 
+class ScaledActionFlowModel(nn.Module):
+    def __init__(self, scale: float):
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(scale))
+
+    def forward(self, actions: Tensor, timesteps: Tensor, conditioning_vec: Tensor) -> Tensor:
+        del timesteps, conditioning_vec
+        return self.scale * actions
+
+
 class DropoutFlowModel(TinyFlowModel):
     def __init__(self, action_dim: int, conditioning_dim: int, dropout: float):
         super().__init__(action_dim, conditioning_dim)
@@ -151,6 +264,25 @@ def test_dct_coe_num_validation_rejects_out_of_range_values(dct_coe_num: int):
 def test_dct_coe_num_validation_accepts_boundaries(dct_coe_num: int):
     config = MultiTaskDiTConfig(horizon=4, dct_coe_num=dct_coe_num)
     assert config.dct_coe_num == dct_coe_num
+
+
+@pytest.mark.parametrize("phy_loss_weight", [-1.0, float("nan"), float("inf")])
+def test_phy_loss_weight_validation_rejects_invalid_values(phy_loss_weight: float):
+    with pytest.raises(ValueError, match="phy_loss_weight"):
+        MultiTaskDiTConfig(phy_loss_weight=phy_loss_weight)
+
+
+def test_positive_phy_loss_weight_requires_flow_matching_and_accepts_dct_k0():
+    with pytest.raises(ValueError, match="flow_matching"):
+        MultiTaskDiTConfig(phy_loss_weight=1.0, dct_coe_num=4)
+
+    config = MultiTaskDiTConfig(
+        objective="flow_matching",
+        horizon=4,
+        phy_loss_weight=1.0,
+        dct_coe_num=0,
+    )
+    assert config.phy_loss_weight == 1.0
 
 
 @pytest.mark.parametrize(
@@ -471,7 +603,7 @@ def test_central_difference_keeps_flow_chunk_and_padding_mask_centered_during_wa
         return original_flow_loss(predicted_velocity, target_velocity, action_is_pad)
 
     monkeypatch.setattr(objective, "_flow_loss", record_flow_loss)
-    loss, _ = objective.compute_loss(
+    loss, metrics = objective.compute_loss(
         model,
         {ACTION: actions, "action_is_pad": action_is_pad},
         torch.randn(1, conditioning_dim),
@@ -483,10 +615,244 @@ def test_central_difference_keeps_flow_chunk_and_padding_mask_centered_during_wa
     torch.testing.assert_close(model.last_actions, actions[:, 1 : horizon + 1])
     assert len(captured_pad) == 1
     torch.testing.assert_close(captured_pad[0], action_is_pad[:, 1 : horizon + 1])
+    assert metrics["lambda_flow_k"] == 0.0
+    assert metrics["physical_loss"] == 0.0  # t=1 makes t(1-t) vanish, including in warmup.
+    assert metrics["weighted_physical_loss"] == 0.0
 
 
-@pytest.mark.parametrize("enable_stochastic", [False, True])
-def test_gripper_is_masked_before_action_jvp(monkeypatch, enable_stochastic: bool):
+def test_dct_physical_loss_matches_value_level_formula_and_total(monkeypatch):
+    horizon = 5
+    action_dim = 2
+    weight = 2.5
+    objective = _make_objective(
+        horizon=horizon,
+        action_dim=action_dim,
+        dct_coe_num=horizon,
+        lambda_flow_k=0.0,
+        phy_loss_weight=weight,
+    )
+    timesteps = torch.tensor([0.25, 0.75])
+    monkeypatch.setattr(
+        objective,
+        "_sample_timesteps",
+        lambda batch_size, device: timesteps.to(device),
+    )
+    monkeypatch.setattr(torch, "randn_like", lambda data: torch.zeros_like(data))
+    actions = _single_mode_actions(
+        horizon,
+        mode=2,
+        coefficients=torch.tensor([1.5, -0.75]),
+        batch_scales=torch.tensor([1.0, 0.5]),
+    )
+    fps = torch.tensor([10.0, 20.0])
+    model = ScaledActionFlowModel(scale=0.2)
+
+    loss, metrics = objective.compute_loss(
+        model,
+        {ACTION: actions, "sample_frequency": fps},
+        conditioning_vec=torch.zeros(2, 1),
+    )
+
+    t_expanded = timesteps.view(-1, 1, 1)
+    predicted_velocity = model.scale * t_expanded * actions
+    target_velocity = actions
+    flow_error = predicted_velocity - target_velocity
+    g_flow_error = objective._action_dot(flow_error, fps.view(-1, 1, 1))
+    physical_residual = t_expanded * (1 - t_expanded) * g_flow_error
+    expected_physical_loss = physical_residual.square().mean()
+    expected_flow_loss = flow_error.square().mean()
+    expected_total = expected_flow_loss + weight * expected_physical_loss
+
+    torch.testing.assert_close(loss, expected_total)
+    assert metrics["physical_loss"] == pytest.approx(expected_physical_loss.item())
+    assert metrics["weighted_physical_loss"] == pytest.approx((weight * expected_physical_loss).item())
+    assert metrics["phy_loss_weight"] == weight
+    loss.backward()
+    assert model.scale.grad is not None
+    assert torch.isfinite(model.scale.grad)
+
+
+def test_dct_k0_physical_derivative_is_second_order_accurate_at_boundaries():
+    horizon = 6
+    objective = _make_objective(horizon=horizon, action_dim=2, dct_coe_num=0)
+    sample_index = torch.arange(horizon, dtype=torch.float64)
+    flow_error = torch.stack((sample_index.square(), 3.0 * sample_index + 2.0), dim=-1)
+    flow_error = flow_error.unsqueeze(0)
+    fps = torch.tensor(10.0, dtype=torch.float64)
+
+    actual = objective._physical_action_dot(flow_error, fps)
+
+    expected = torch.stack((2.0 * sample_index, torch.full_like(sample_index, 3.0)), dim=-1)
+    torch.testing.assert_close(actual, expected.unsqueeze(0) * fps)
+
+
+def test_physical_weight_only_changes_final_aggregation_not_fm_or_jvp(monkeypatch):
+    torch.manual_seed(0)
+    horizon = 4
+    action_dim = 3
+    conditioning_dim = 6
+    weight = 0.7
+    timesteps = torch.tensor([0.3, 0.8])
+    objectives = [
+        _make_objective(
+            horizon=horizon,
+            action_dim=action_dim,
+            dct_coe_num=horizon,
+            lambda_flow_k=0.2,
+            phy_loss_weight=phy_loss_weight,
+        )
+        for phy_loss_weight in (0.0, weight)
+    ]
+    for objective in objectives:
+        monkeypatch.setattr(
+            objective,
+            "_sample_timesteps",
+            lambda batch_size, device: timesteps.to(device),
+        )
+    monkeypatch.setattr(torch, "randn_like", lambda data: torch.zeros_like(data))
+    actions = torch.randn(2, horizon, action_dim)
+    conditioning_steps = torch.randn(2, 2, conditioning_dim // 2)
+    derivative_stencil = _reverse_conditioning_stencil(conditioning_steps)
+    conditioning_vec = conditioning_steps.flatten(start_dim=1)
+    model = TinyFlowModel(action_dim, conditioning_dim)
+
+    baseline_loss, baseline_metrics = objectives[0].compute_loss(
+        model,
+        {ACTION: actions},
+        conditioning_vec,
+        conditioning_steps=conditioning_steps,
+        derivative_conditioning_steps=derivative_stencil,
+    )
+    physical_loss, physical_metrics = objectives[1].compute_loss(
+        model,
+        {ACTION: actions},
+        conditioning_vec,
+        conditioning_steps=conditioning_steps,
+        derivative_conditioning_steps=derivative_stencil,
+    )
+
+    for metric in (
+        "flow_loss",
+        "kinematic_loss",
+        "physical_loss",
+        "kinematic_state_jvp_rms",
+        "kinematic_action_jvp_rms",
+    ):
+        assert physical_metrics[metric] == pytest.approx(baseline_metrics[metric])
+    assert baseline_metrics["physical_loss"] > 0
+    torch.testing.assert_close(
+        physical_loss,
+        baseline_loss + weight * torch.tensor(physical_metrics["physical_loss"]),
+    )
+
+
+@pytest.mark.parametrize("phy_loss_weight", [0.0, 0.5])
+@pytest.mark.parametrize("lambda_flow_k", [0.0, 0.2])
+def test_physical_metrics_are_reported_with_and_without_kinematic_loss(
+    monkeypatch,
+    phy_loss_weight: float,
+    lambda_flow_k: float,
+):
+    torch.manual_seed(1)
+    horizon = 4
+    action_dim = 3
+    conditioning_dim = 6
+    objective = _make_objective(
+        horizon=horizon,
+        action_dim=action_dim,
+        dct_coe_num=horizon,
+        lambda_flow_k=lambda_flow_k,
+        phy_loss_weight=phy_loss_weight,
+    )
+    monkeypatch.setattr(
+        objective,
+        "_sample_timesteps",
+        lambda batch_size, device: torch.full((batch_size,), 0.4, device=device),
+    )
+    monkeypatch.setattr(torch, "randn_like", lambda data: torch.zeros_like(data))
+    conditioning_steps = torch.randn(2, 2, conditioning_dim // 2)
+
+    loss, metrics = objective.compute_loss(
+        TinyFlowModel(action_dim, conditioning_dim),
+        {ACTION: torch.randn(2, horizon, action_dim)},
+        conditioning_steps.flatten(start_dim=1),
+        conditioning_steps=conditioning_steps,
+        derivative_conditioning_steps=_reverse_conditioning_stencil(conditioning_steps),
+    )
+
+    assert metrics["physical_loss"] > 0
+    assert metrics["weighted_physical_loss"] == pytest.approx(phy_loss_weight * metrics["physical_loss"])
+    if lambda_flow_k > 0:
+        assert "kinematic_residual_time_weight_mean" in metrics
+        assert "kinematic_loss_time_weight_mean" in metrics
+    assert loss.item() == pytest.approx(
+        metrics["flow_loss"]
+        + metrics["lambda_flow_k"] * metrics["kinematic_loss"]
+        + metrics["weighted_physical_loss"]
+    )
+
+
+@pytest.mark.parametrize("phy_loss_weight", [0.0, 0.5])
+def test_dct_k0_logs_real_physical_loss_for_zero_and_positive_weight(
+    monkeypatch,
+    phy_loss_weight: float,
+):
+    horizon = 4
+    objective = _make_objective(
+        horizon=horizon,
+        action_dim=2,
+        dct_coe_num=0,
+        lambda_flow_k=0.0,
+        phy_loss_weight=phy_loss_weight,
+    )
+    timesteps = torch.full((2,), 0.5)
+    monkeypatch.setattr(
+        objective,
+        "_sample_timesteps",
+        lambda batch_size, device: timesteps.to(device),
+    )
+    monkeypatch.setattr(torch, "randn_like", lambda data: torch.zeros_like(data))
+    monkeypatch.setattr(
+        objective,
+        "_action_dot",
+        lambda *args, **kwargs: pytest.fail("K0 physical loss must not use the H+2 JVP stencil"),
+    )
+    model = ScaledActionFlowModel(scale=0.3)
+    sample_index = torch.arange(horizon, dtype=torch.float32)
+    actions = torch.stack((sample_index.square(), sample_index), dim=-1)
+    actions = actions.unsqueeze(0).repeat(2, 1, 1)
+
+    loss, metrics = objective.compute_loss(
+        model,
+        {ACTION: actions},
+        conditioning_vec=torch.zeros(2, 1),
+    )
+
+    assert torch.isfinite(loss)
+    assert metrics["physical_loss"] > 0
+    assert metrics["weighted_physical_loss"] == pytest.approx(phy_loss_weight * metrics["physical_loss"])
+    if phy_loss_weight > 0:
+        loss.backward()
+        assert model.scale.grad is not None
+        assert torch.isfinite(model.scale.grad)
+
+
+def test_physical_masked_mean_reuses_flow_padding_semantics():
+    objective = _make_objective(
+        horizon=3,
+        action_dim=2,
+        dct_coe_num=3,
+        do_mask_loss_for_padding=True,
+    )
+    values = torch.tensor([[[1.0, 3.0], [100.0, 200.0], [5.0, 7.0]]])
+    action_is_pad = torch.tensor([[False, True, False]])
+
+    actual = objective._masked_action_mean(values, action_is_pad)
+
+    torch.testing.assert_close(actual, torch.tensor(4.0))
+
+
+def test_gripper_is_masked_before_action_jvp(monkeypatch):
     torch.manual_seed(0)
     horizon = 4
     action_dim = 3
@@ -495,9 +861,7 @@ def test_gripper_is_masked_before_action_jvp(monkeypatch, enable_stochastic: boo
         horizon=horizon,
         action_dim=action_dim,
         dct_coe_num=2,
-        enable_stochastic=enable_stochastic,
         gripper_first=False,
-        use_jvp_ak=True,
     )
     model = TinyFlowModel(action_dim, conditioning_dim)
     coefficients = torch.tensor([0.7, -1.2, 2.0])
@@ -509,31 +873,17 @@ def test_gripper_is_masked_before_action_jvp(monkeypatch, enable_stochastic: boo
     conditioning_vec = conditioning_steps.flatten(start_dim=1)
     captured_action_tangents = []
 
-    if enable_stochastic:
-        original_jvp = torch.autograd.functional.jvp
+    original_jvp = torch.func.jvp
 
-        def record_jvp(func, inputs, v=None, *args, **kwargs):
-            tangents = v if isinstance(v, tuple) else (v,)
-            captured_action_tangents.extend(
-                tangent.detach().clone()
-                for tangent in tangents
-                if isinstance(tangent, Tensor) and tangent.ndim == 3
-            )
-            return original_jvp(func, inputs, v, *args, **kwargs)
+    def record_jvp(func, primals, tangents, *args, **kwargs):
+        captured_action_tangents.extend(
+            tangent.detach().clone()
+            for tangent in tangents
+            if isinstance(tangent, Tensor) and tangent.ndim == 3
+        )
+        return original_jvp(func, primals, tangents, *args, **kwargs)
 
-        monkeypatch.setattr(torch.autograd.functional, "jvp", record_jvp)
-    else:
-        original_jvp = torch.func.jvp
-
-        def record_jvp(func, primals, tangents, *args, **kwargs):
-            captured_action_tangents.extend(
-                tangent.detach().clone()
-                for tangent in tangents
-                if isinstance(tangent, Tensor) and tangent.ndim == 3
-            )
-            return original_jvp(func, primals, tangents, *args, **kwargs)
-
-        monkeypatch.setattr(torch.func, "jvp", record_jvp)
+    monkeypatch.setattr(torch.func, "jvp", record_jvp)
 
     objective._compute_kinematic_loss(
         model=model,
@@ -553,46 +903,7 @@ def test_gripper_is_masked_before_action_jvp(monkeypatch, enable_stochastic: boo
     assert torch.count_nonzero(tangent[..., -1]) == 0
 
 
-@pytest.mark.parametrize("enable_stochastic", [False, True])
-def test_use_1_k_scales_state_jvp_by_one_minus_flow_time(enable_stochastic: bool):
-    horizon = 4
-    action_dim = 3
-    conditioning_dim = 6
-    model = TinyFlowModel(action_dim, conditioning_dim)
-    actions = torch.zeros(1, horizon + 2, action_dim)
-    data = actions[:, 1 : horizon + 1]
-    x_t = torch.randn_like(data)
-    timesteps = torch.full((1,), 0.25)
-    conditioning_steps = torch.randn(1, 2, conditioning_dim // 2)
-    conditioning_vec = conditioning_steps.flatten(start_dim=1)
-
-    losses = []
-    for use_1_k in (False, True):
-        objective = _make_objective(
-            horizon=horizon,
-            action_dim=action_dim,
-            enable_stochastic=enable_stochastic,
-            use_1_k=use_1_k,
-            use_jvp_ak=False,
-        )
-        _, kinematic_loss, _, _ = objective._compute_kinematic_loss(
-            model=model,
-            batch={ACTION: actions},
-            data=data,
-            action_sequence=actions,
-            x_t=x_t,
-            t=timesteps,
-            conditioning_vec=conditioning_vec,
-            conditioning_steps=conditioning_steps,
-            derivative_conditioning_steps=_reverse_conditioning_stencil(conditioning_steps),
-        )
-        losses.append(kinematic_loss)
-
-    torch.testing.assert_close(losses[1], losses[0] * 0.75**2)
-
-
-@pytest.mark.parametrize("enable_stochastic", [False, True])
-def test_use_jvp_ak_scales_full_residual_by_one_minus_flow_time(enable_stochastic: bool):
+def test_full_jvp_reports_one_minus_k_time_weights():
     horizon = 4
     action_dim = 3
     conditioning_dim = 6
@@ -611,32 +922,78 @@ def test_use_jvp_ak_scales_full_residual_by_one_minus_flow_time(enable_stochasti
     conditioning_steps = torch.randn(2, 2, conditioning_dim // 2)
     conditioning_vec = conditioning_steps.flatten(start_dim=1)
 
-    losses = []
-    for use_jvp_ak in (False, True):
-        objective = _make_objective(
-            horizon=horizon,
-            action_dim=action_dim,
-            enable_stochastic=enable_stochastic,
-            use_jvp_ak=use_jvp_ak,
-        )
-        _, kinematic_loss, _, _ = objective._compute_kinematic_loss(
-            model=model,
-            batch={ACTION: actions},
-            data=data,
-            action_sequence=actions,
-            x_t=x_t,
-            t=timesteps,
-            conditioning_vec=conditioning_vec,
-            conditioning_steps=conditioning_steps,
-            derivative_conditioning_steps=_reverse_conditioning_stencil(conditioning_steps),
-        )
-        losses.append(kinematic_loss)
+    objective = _make_objective(
+        horizon=horizon,
+        action_dim=action_dim,
+    )
+    _, kinematic_loss, _, metrics = objective._compute_kinematic_loss(
+        model=model,
+        batch={ACTION: actions},
+        data=data,
+        action_sequence=actions,
+        x_t=x_t,
+        t=timesteps,
+        conditioning_vec=conditioning_vec,
+        conditioning_steps=conditioning_steps,
+        derivative_conditioning_steps=_reverse_conditioning_stencil(conditioning_steps),
+    )
 
-    torch.testing.assert_close(losses[0], torch.tensor(250.0))
-    torch.testing.assert_close(losses[1], torch.tensor(78.125))
+    # The full-JVP residual multiplier is (1-k), so the loss uses (1-k)^2.
+    torch.testing.assert_close(kinematic_loss, torch.tensor(78.125))
+    torch.testing.assert_close(metrics["kinematic_residual_time_weight_mean"], torch.tensor(0.625))
+    torch.testing.assert_close(metrics["kinematic_loss_time_weight_mean"], torch.tensor(0.40625))
 
 
-def test_stop_gradient_jvp_ak_preserves_forward_and_blocks_action_jvp_gradient():
+def test_kinematic_loss_backpropagates_through_action_and_conditioning_jvps():
+    horizon = 4
+    action_dim = 3
+    conditioning_step_dim = 3
+    conditioning_dim = 2 * conditioning_step_dim
+    action_steps = torch.arange(horizon + 2, dtype=torch.float32)
+    actions = action_steps[None, :, None].expand(1, -1, action_dim).clone()
+    data = actions[:, 1 : horizon + 1]
+    x_t = torch.randn_like(data)
+    timesteps = torch.full((1,), 0.5)
+    conditioning_steps = torch.tensor(
+        [[[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]],
+    )
+    conditioning_vec = conditioning_steps.flatten(start_dim=1)
+
+    model = TinyFlowModel(action_dim, conditioning_dim)
+    with torch.no_grad():
+        model.action_projection.weight.copy_(torch.eye(action_dim))
+        model.conditioning_projection.weight.fill_(0.01)
+        model.time_scale.zero_()
+    objective = _make_objective(
+        horizon=horizon,
+        action_dim=action_dim,
+    )
+    _, kinematic_loss, _, _ = objective._compute_kinematic_loss(
+        model=model,
+        batch={ACTION: actions},
+        data=data,
+        action_sequence=actions,
+        x_t=x_t,
+        t=timesteps,
+        conditioning_vec=conditioning_vec,
+        conditioning_steps=conditioning_steps,
+        derivative_conditioning_steps=_reverse_conditioning_stencil(conditioning_steps),
+    )
+    kinematic_loss.backward()
+    action_grad = model.action_projection.weight.grad
+    conditioning_grad = model.conditioning_projection.weight.grad
+    assert action_grad is not None
+    assert torch.isfinite(action_grad).all()
+    assert torch.count_nonzero(action_grad) > 0
+    assert conditioning_grad is not None
+    assert torch.isfinite(conditioning_grad).all()
+    assert torch.count_nonzero(conditioning_grad) > 0
+
+
+@pytest.mark.parametrize("action_jvp_grad_scale", [0.1, 0.25])
+def test_action_jvp_grad_scale_preserves_forward_and_scales_action_gradient(
+    action_jvp_grad_scale: float,
+):
     horizon = 4
     action_dim = 3
     conditioning_step_dim = 3
@@ -653,7 +1010,7 @@ def test_stop_gradient_jvp_ak_preserves_forward_and_blocks_action_jvp_gradient()
 
     losses = []
     gradients = []
-    for stop_gradient_jvp_ak in (False, True):
+    for grad_scale in (1.0, action_jvp_grad_scale):
         model = TinyFlowModel(action_dim, conditioning_dim)
         with torch.no_grad():
             model.action_projection.weight.copy_(torch.eye(action_dim))
@@ -662,9 +1019,7 @@ def test_stop_gradient_jvp_ak_preserves_forward_and_blocks_action_jvp_gradient()
         objective = _make_objective(
             horizon=horizon,
             action_dim=action_dim,
-            enable_stochastic=False,
-            stop_gradient_jvp_ak=stop_gradient_jvp_ak,
-            use_jvp_ak=True,
+            action_jvp_grad_scale=grad_scale,
         )
         _, kinematic_loss, _, _ = objective._compute_kinematic_loss(
             model=model,
@@ -681,30 +1036,33 @@ def test_stop_gradient_jvp_ak_preserves_forward_and_blocks_action_jvp_gradient()
         losses.append(kinematic_loss.detach())
         gradients.append(
             (
-                model.action_projection.weight.grad,
-                model.conditioning_projection.weight.grad,
+                model.action_projection.weight.grad.clone(),
+                model.conditioning_projection.weight.grad.clone(),
             )
         )
 
     torch.testing.assert_close(losses[1], losses[0])
     full_action_grad, full_conditioning_grad = gradients[0]
-    stopped_action_grad, stopped_conditioning_grad = gradients[1]
-    assert full_action_grad is not None
-    assert torch.count_nonzero(full_action_grad) > 0
-    assert full_conditioning_grad is not None
-    assert torch.count_nonzero(full_conditioning_grad) > 0
-    assert stopped_action_grad is None or torch.count_nonzero(stopped_action_grad) == 0
-    assert stopped_conditioning_grad is not None
-    assert torch.count_nonzero(stopped_conditioning_grad) > 0
-    torch.testing.assert_close(stopped_conditioning_grad, full_conditioning_grad)
+    scaled_action_grad, scaled_conditioning_grad = gradients[1]
+    torch.testing.assert_close(
+        scaled_action_grad,
+        action_jvp_grad_scale * full_action_grad,
+    )
+    torch.testing.assert_close(scaled_conditioning_grad, full_conditioning_grad)
+
+
+@pytest.mark.parametrize("action_jvp_grad_scale", [-0.1, 1.1, float("nan"), float("inf")])
+def test_action_jvp_grad_scale_validation_rejects_invalid_values(
+    action_jvp_grad_scale: float,
+):
+    with pytest.raises(ValueError, match="action_jvp_grad_scale"):
+        MultiTaskDiTConfig(action_jvp_grad_scale=action_jvp_grad_scale)
 
 
 @pytest.mark.parametrize("dropout", [0.0, 0.5])
-@pytest.mark.parametrize("stop_gradient_jvp_ak", [False, True])
 def test_nonstochastic_jvp_terms_share_dropout_realization(
     monkeypatch,
     dropout: float,
-    stop_gradient_jvp_ak: bool,
 ):
     torch.manual_seed(123)
     horizon = 4
@@ -715,9 +1073,6 @@ def test_nonstochastic_jvp_terms_share_dropout_realization(
         horizon=horizon,
         action_dim=action_dim,
         dct_coe_num=horizon,
-        enable_stochastic=False,
-        stop_gradient_jvp_ak=stop_gradient_jvp_ak,
-        use_jvp_ak=True,
     )
     model = DropoutFlowModel(action_dim, conditioning_dim, dropout=dropout).train()
     with torch.no_grad():
@@ -782,12 +1137,7 @@ def test_nonstochastic_jvp_terms_share_dropout_realization(
     torch.set_rng_state(rng_after_shared_jvps)
 
 
-@pytest.mark.parametrize("use_jvp_ak", [False, True])
-@pytest.mark.parametrize("enable_stochastic", [False, True])
-def test_dct_kinematic_branches_support_forward_and_backward(
-    use_jvp_ak: bool,
-    enable_stochastic: bool,
-):
+def test_dct_kinematic_loss_supports_forward_and_backward():
     torch.manual_seed(0)
     batch_size = 2
     horizon = 4
@@ -798,8 +1148,6 @@ def test_dct_kinematic_branches_support_forward_and_backward(
         horizon=horizon,
         action_dim=action_dim,
         dct_coe_num=horizon,
-        enable_stochastic=enable_stochastic,
-        use_jvp_ak=use_jvp_ak,
     )
     model = TinyFlowModel(action_dim, conditioning_dim)
     batch = {ACTION: torch.randn(batch_size, horizon, action_dim)}
@@ -823,11 +1171,7 @@ def test_dct_kinematic_branches_support_forward_and_backward(
 
     assert torch.isfinite(loss)
     assert math.isfinite(output["kinematic_loss"])
-    if not enable_stochastic:
-        assert math.isfinite(output["kinematic_state_jvp_rms"])
-        if use_jvp_ak:
-            assert math.isfinite(output["kinematic_action_jvp_rms"])
-        else:
-            assert "kinematic_action_jvp_rms" not in output
+    assert math.isfinite(output["kinematic_state_jvp_rms"])
+    assert math.isfinite(output["kinematic_action_jvp_rms"])
     assert all(parameter.grad is not None for parameter in model.parameters())
     assert all(torch.isfinite(parameter.grad).all() for parameter in model.parameters())
