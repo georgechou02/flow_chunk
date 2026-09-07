@@ -170,6 +170,7 @@ def rollout(
     recording_repo_id: str | None = None,
     recording_private: bool = False,
     predicted_latents_callback: Callable[[PreTrainedPolicy], None] | None = None,
+    image_preprocessing_device: torch.device | str | None = None,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -202,6 +203,7 @@ def rollout(
         predicted_latents_callback: Optional callback invoked after every ``select_action`` with the policy
             itself. World-model policies (e.g. LingBot-VA) stash predicted video latents on
             ``policy.last_predicted_latents``; this lets the caller concatenate chunks and decode once.
+        image_preprocessing_device: Optional device for converting raw uint8 images to float tensors.
     Returns:
         The dictionary described above.
     """
@@ -260,7 +262,7 @@ def rollout(
     try:
         while not np.all(done) and step < max_steps:
             # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
-            observation = preprocess_observation(observation)
+            observation = preprocess_observation(observation, image_device=image_preprocessing_device)
             if return_observations:
                 all_observations.append(deepcopy(observation))
 
@@ -378,7 +380,7 @@ def rollout(
 
     # Track the final observation.
     if return_observations:
-        observation = preprocess_observation(observation)
+        observation = preprocess_observation(observation, image_device=image_preprocessing_device)
         all_observations.append(deepcopy(observation))
 
     # Stack the sequence along the first dimension so that we have (batch, sequence, *) tensors.
@@ -417,6 +419,7 @@ def eval_policy(
     recording_repo_id: str | None = None,
     recording_private: bool = False,
     save_predicted_video: bool = False,
+    image_preprocessing_device: torch.device | str | None = None,
 ) -> dict:
     """
     Args:
@@ -429,6 +432,7 @@ def eval_policy(
             the "episodes" key of the returned dictionary.
         start_seed: The first seed to use for the first individual rollout. For all subsequent rollouts the
             seed is incremented by 1. If not provided, the environments are not manually seeded.
+        image_preprocessing_device: Optional device for raw-image conversion during rollouts.
     Returns:
         Dictionary with metrics and data regarding the rollouts.
     """
@@ -527,6 +531,7 @@ def eval_policy(
             preprocessor=preprocessor,
             postprocessor=postprocessor,
             seeds=list(seeds) if seeds else None,
+            image_preprocessing_device=image_preprocessing_device,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
             recording_dir=recording_dir,
@@ -769,8 +774,10 @@ def eval_main(cfg: EvalPipelineConfig):
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
 
     recording_dir = Path(cfg.output_dir) / "recordings" if cfg.eval.recording else None
-    max_episodes_rendered = 0 if cfg.eval.recording else 10
-    videos_dir = None if cfg.eval.recording else Path(cfg.output_dir) / "videos"
+    max_episodes_rendered = 0 if cfg.eval.recording else cfg.eval.max_episodes_rendered
+    videos_dir = (
+        Path(cfg.output_dir) / "videos" if not cfg.eval.recording and max_episodes_rendered > 0 else None
+    )
 
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         info = eval_policy_all(
@@ -786,6 +793,7 @@ def eval_main(cfg: EvalPipelineConfig):
             return_episode_data=False,
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
+            image_preprocessing_device=device if cfg.eval.fast_image_preprocessing else None,
             recording_dir=recording_dir,
             env_features=cfg.env.features if cfg.eval.recording else None,
             recording_repo_id=cfg.eval.recording_repo_id,
@@ -837,6 +845,7 @@ def eval_one(
     env_features: dict | None = None,
     recording_repo_id: str | None = None,
     recording_private: bool = False,
+    image_preprocessing_device: torch.device | str | None = None,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -858,6 +867,7 @@ def eval_one(
         env_features=env_features,
         recording_repo_id=recording_repo_id,
         recording_private=recording_private,
+        image_preprocessing_device=image_preprocessing_device,
     )
 
     per_episode = task_result["per_episode"]
@@ -889,6 +899,7 @@ def run_one(
     env_features: dict | None = None,
     recording_repo_id: str | None = None,
     recording_private: bool = False,
+    image_preprocessing_device: torch.device | str | None = None,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -923,6 +934,7 @@ def run_one(
         env_features=env_features,
         recording_repo_id=task_repo_id,
         recording_private=recording_private,
+        image_preprocessing_device=image_preprocessing_device,
     )
 
     if max_episodes_rendered > 0:
@@ -949,6 +961,7 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    image_preprocessing_device: torch.device | str | None = None,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -1008,6 +1021,7 @@ def eval_policy_all(
         env_features=env_features,
         recording_repo_id=recording_repo_id,
         recording_private=recording_private,
+        image_preprocessing_device=image_preprocessing_device,
     )
 
     if max_parallel_tasks <= 1:

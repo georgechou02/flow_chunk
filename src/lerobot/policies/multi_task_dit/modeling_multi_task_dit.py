@@ -77,7 +77,11 @@ def _sdpa_math_kernel_context():
     """Force math SDPA for higher-order AD paths that are unsupported by flash kernels."""
     if sdpa_kernel is not None and SDPBackend is not None:
         return sdpa_kernel(SDPBackend.MATH)
-    if torch.cuda.is_available() and hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "sdp_kernel"):
+    if (
+        torch.cuda.is_available()
+        and hasattr(torch.backends, "cuda")
+        and hasattr(torch.backends.cuda, "sdp_kernel")
+    ):
         return torch.backends.cuda.sdp_kernel(
             enable_flash=False,
             enable_mem_efficient=False,
@@ -112,14 +116,9 @@ def _parameter_averaged_bspline_knots(
         )
     pseudo_grid = torch.linspace(0.0, 1.0, coefficient_count, dtype=dtype, device=device)
     internal_values = [
-        pseudo_grid[index : index + degree].mean()
-        for index in range(1, coefficient_count - degree)
+        pseudo_grid[index : index + degree].mean() for index in range(1, coefficient_count - degree)
     ]
-    internal = (
-        torch.stack(internal_values)
-        if internal_values
-        else torch.empty(0, dtype=dtype, device=device)
-    )
+    internal = torch.stack(internal_values) if internal_values else torch.empty(0, dtype=dtype, device=device)
     endpoints = torch.zeros(degree + 1, dtype=dtype, device=device)
     return torch.cat((endpoints, internal, torch.ones_like(endpoints)))
 
@@ -172,9 +171,7 @@ def _bspline_design_and_derivative(
     lower_basis = _bspline_basis_matrix(sample_u, knots, degree - 1)
 
     left_denominator = knots[degree : degree + coefficient_count] - knots[:coefficient_count]
-    right_denominator = (
-        knots[degree + 1 : degree + coefficient_count + 1] - knots[1 : coefficient_count + 1]
-    )
+    right_denominator = knots[degree + 1 : degree + coefficient_count + 1] - knots[1 : coefficient_count + 1]
     left_scale = torch.where(
         left_denominator != 0,
         degree / torch.where(left_denominator != 0, left_denominator, torch.ones_like(left_denominator)),
@@ -182,9 +179,7 @@ def _bspline_design_and_derivative(
     )
     right_scale = torch.where(
         right_denominator != 0,
-        degree / torch.where(
-            right_denominator != 0, right_denominator, torch.ones_like(right_denominator)
-        ),
+        degree / torch.where(right_denominator != 0, right_denominator, torch.ones_like(right_denominator)),
         torch.zeros_like(right_denominator),
     )
     derivative = (
@@ -271,6 +266,76 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
     def _maybe_increment_train_step(self) -> None:
         if self.training and torch.is_grad_enabled():
             self._train_step.add_(1)
+
+    def _should_compute_clean_action_metrics(self) -> bool:
+        frequency = self.config.clean_action_log_freq
+        return (
+            self.config.is_flow_matching
+            and self.training
+            and torch.is_grad_enabled()
+            and frequency > 0
+            and (int(self._train_step.item()) + 1) % frequency == 0
+        )
+
+    @torch.no_grad()
+    def _compute_clean_action_metrics(
+        self,
+        batch: dict[str, Tensor],
+        conditioning_start: int,
+    ) -> dict[str, float]:
+        """Measure inference-ODE actions against the normalized expert execution window."""
+        uses_central_action_stencil = (
+            self.config.lambda_flow_k > 0 and self.objective._uses_legacy_central_action_stencil()
+        )
+        data_start = int(uses_central_action_stencil)
+        execution_start = self.config.n_obs_steps - 1
+        execution_end = execution_start + self.config.n_action_steps
+        target = batch[ACTION][:, data_start + execution_start : data_start + execution_end]
+
+        inference_batch = dict(batch)
+        observation_end = conditioning_start + self.config.n_obs_steps
+        inference_batch[OBS_STATE] = batch[OBS_STATE][:, conditioning_start:observation_end]
+        if OBS_IMAGES in batch:
+            inference_batch[OBS_IMAGES] = batch[OBS_IMAGES][:, conditioning_start:observation_end]
+
+        # A fixed Gaussian prior makes this sparse metric comparable over time and
+        # avoids advancing the RNG stream used by the training objective.
+        generator = torch.Generator(device="cpu").manual_seed(0)
+        model_dtype = next(self.noise_predictor.parameters()).dtype
+        noise = torch.randn(
+            (target.shape[0], self.config.horizon, target.shape[-1]),
+            generator=generator,
+            dtype=torch.float32,
+        ).to(device=target.device, dtype=model_dtype)
+
+        training_states = {module: module.training for module in self.modules()}
+        try:
+            self.eval()
+            conditioning_vec = self.observation_encoder.encode(inference_batch)
+            predicted_full = self.objective.conditional_sample(
+                self.noise_predictor,
+                target.shape[0],
+                conditioning_vec,
+                noise=noise,
+            )
+        finally:
+            for module, training in training_states.items():
+                module.training = training
+
+        predicted = predicted_full[:, execution_start:execution_end]
+        squared_error = (predicted.float() - target.float()).square()
+        if "action_is_pad" in batch:
+            valid_steps = ~batch["action_is_pad"][
+                :, data_start + execution_start : data_start + execution_end
+            ].to(device=squared_error.device, dtype=torch.bool)
+        else:
+            valid_steps = torch.ones(squared_error.shape[:2], dtype=torch.bool, device=squared_error.device)
+        valid = valid_steps.unsqueeze(-1).expand_as(squared_error)
+        clean_action_mse = (squared_error * valid).sum() / valid.sum().clamp_min(1)
+        return {
+            "clean_action_mse": clean_action_mse.item(),
+            "clean_action_valid_ratio": valid_steps.float().mean().item(),
+        }
 
     def _generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
@@ -378,6 +443,8 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
                 derivative_conditioning_steps=derivative_conditioning_steps,
                 train_step=train_step,
             )
+            if self._should_compute_clean_action_metrics():
+                output_dict.update(self._compute_clean_action_metrics(batch, conditioning_start))
             self._maybe_increment_train_step()
             return loss, output_dict
 
@@ -544,9 +611,7 @@ class ObservationEncoder(nn.Module):
             self.camera_names = list(config.image_features.keys())
 
             if config.use_separate_rgb_encoder_per_camera:
-                self.vision_encoders = nn.ModuleList(
-                    [self._make_vision_encoder() for _ in self.camera_names]
-                )
+                self.vision_encoders = nn.ModuleList([self._make_vision_encoder() for _ in self.camera_names])
                 self.vision_encoder = None
             else:
                 self.vision_encoder = self._make_vision_encoder()
@@ -1015,12 +1080,9 @@ class FlowMatchingObjective(nn.Module):
         self.interpolation_mode = getattr(config, "interpolation_mode", "dct").lower()
         if self.interpolation_mode not in {"dct", "bspline"}:
             raise ValueError(
-                "interpolation_mode must be 'dct' or 'bspline', "
-                f"got '{self.interpolation_mode}'"
+                f"interpolation_mode must be 'dct' or 'bspline', got '{self.interpolation_mode}'"
             )
-        self._bspline_matrix_cache: dict[
-            tuple[torch.device, torch.dtype], tuple[Tensor, Tensor]
-        ] = {}
+        self._bspline_matrix_cache: dict[tuple[torch.device, torch.dtype], tuple[Tensor, Tensor]] = {}
         self._bspline_analysis_cpu: Tensor | None = None
         self._bspline_derivative_basis_cpu: Tensor | None = None
         if self.interpolation_mode == "bspline":
@@ -1047,9 +1109,7 @@ class FlowMatchingObjective(nn.Module):
             )
             pinv_rtol = 1e-13
             singular_values = torch.linalg.svdvals(design)
-            effective_rank = int(
-                torch.count_nonzero(singular_values > singular_values[0] * pinv_rtol).item()
-            )
+            effective_rank = int(torch.count_nonzero(singular_values > singular_values[0] * pinv_rtol).item())
             if effective_rank != coefficient_count:
                 raise ValueError(
                     "B-spline collocation matrix is numerically rank deficient at the configured "
@@ -1061,9 +1121,7 @@ class FlowMatchingObjective(nn.Module):
             # policy-wide bf16/fp16 conversion cannot destroy their precision.
             analysis = torch.linalg.pinv(design, rtol=pinv_rtol)
             coefficient_identity = torch.eye(coefficient_count, dtype=design.dtype)
-            coefficient_recovery_error = torch.max(
-                torch.abs(analysis @ design - coefficient_identity)
-            ).item()
+            coefficient_recovery_error = torch.max(torch.abs(analysis @ design - coefficient_identity)).item()
             if coefficient_recovery_error > 1e-8:
                 raise ValueError(
                     "B-spline collocation matrix is too ill-conditioned for stable coefficient recovery "
@@ -1072,9 +1130,7 @@ class FlowMatchingObjective(nn.Module):
                 )
             if coefficient_count == horizon:
                 sample_identity = torch.eye(horizon, dtype=design.dtype)
-                sample_reconstruction_error = torch.max(
-                    torch.abs(design @ analysis - sample_identity)
-                ).item()
+                sample_reconstruction_error = torch.max(torch.abs(design @ analysis - sample_identity)).item()
                 if sample_reconstruction_error > 1e-8:
                     raise ValueError(
                         "B-spline M=H fit is not numerically lossless for "
@@ -1105,7 +1161,25 @@ class FlowMatchingObjective(nn.Module):
     def _effective_lambda_flow_k(self, train_step: int | None) -> float:
         if train_step is not None and train_step < self.config.pre_train_steps:
             return 0.0
-        return float(self.config.lambda_flow_k)
+        initial = float(self.config.lambda_flow_k)
+        schedule = getattr(self.config, "lambda_flow_k_schedule", "constant")
+        if train_step is None or schedule == "constant":
+            return initial
+
+        start = getattr(self.config, "lambda_flow_k_schedule_start_step", 0)
+        end = getattr(self.config, "lambda_flow_k_schedule_end_step", 0)
+        final = float(getattr(self.config, "lambda_flow_k_schedule_final", 0.0))
+        if train_step < start:
+            return initial
+        # start == end is the useful hard-switch case: the first update at the
+        # boundary uses the final weight while retaining the original data
+        # window implied by a non-zero configured lambda_flow_k.
+        if train_step >= end:
+            return final
+
+        progress = (train_step - start) / (end - start)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return final + (initial - final) * cosine
 
     def _sample_timesteps(self, batch_size: int, device: torch.device) -> Tensor:
         if self.config.timestep_sampling_strategy == "uniform":
@@ -1167,9 +1241,7 @@ class FlowMatchingObjective(nn.Module):
             if conditioning_steps is None:
                 raise ValueError("conditioning_steps is required when lambda_flow_k > 0.")
             if derivative_conditioning_steps is None:
-                raise ValueError(
-                    "derivative_conditioning_steps is required when lambda_flow_k > 0."
-                )
+                raise ValueError("derivative_conditioning_steps is required when lambda_flow_k > 0.")
             predicted_velocity, kinematic_loss, kinematic_valid_ratio, kinematic_jvp_metrics = (
                 self._compute_kinematic_loss(
                     model=model,
@@ -1191,9 +1263,7 @@ class FlowMatchingObjective(nn.Module):
 
         flow_action_is_pad = None
         if "action_is_pad" in batch:
-            flow_action_is_pad = batch["action_is_pad"][
-                :, data_start : data_start + self.horizon
-            ]
+            flow_action_is_pad = batch["action_is_pad"][:, data_start : data_start + self.horizon]
         flow_loss = self._flow_loss(
             predicted_velocity,
             target_velocity,
@@ -1216,19 +1286,25 @@ class FlowMatchingObjective(nn.Module):
         weighted_physical_loss = (
             phy_loss_weight * physical_loss if phy_loss_weight > 0 else data.new_zeros(())
         )
-        total_loss = (
-            flow_loss + effective_lambda_flow_k * kinematic_loss + weighted_physical_loss
-        )
+        total_loss = flow_loss + effective_lambda_flow_k * kinematic_loss + weighted_physical_loss
 
         output_dict = {
             "flow_loss": flow_loss.detach().float().item(),
             "kinematic_loss": kinematic_loss.detach().float().item(),
             "lambda_flow_k": effective_lambda_flow_k,
             "lambda_flow_k_config": float(self.config.lambda_flow_k),
+            "lambda_flow_k_schedule": getattr(self.config, "lambda_flow_k_schedule", "constant"),
+            "lambda_flow_k_schedule_start_step": int(
+                getattr(self.config, "lambda_flow_k_schedule_start_step", 0)
+            ),
+            "lambda_flow_k_schedule_end_step": int(
+                getattr(self.config, "lambda_flow_k_schedule_end_step", 0)
+            ),
+            "lambda_flow_k_schedule_final": float(getattr(self.config, "lambda_flow_k_schedule_final", 0.0)),
             "pre_train_steps": int(self.config.pre_train_steps),
             "train_step": int(train_step) if train_step is not None else -1,
-            "use_jvp_ak": float(self.config.use_jvp_ak),
-            "stop_gradient_jvp_ak": float(self.config.stop_gradient_jvp_ak),
+            "action_jvp_grad_scale_config": float(getattr(self.config, "action_jvp_grad_scale", 1.0)),
+            "action_jvp_grad_scale_effective": float(getattr(self.config, "action_jvp_grad_scale", 1.0)),
             "gripper_first": float(self.config.gripper_first),
             "physical_loss": physical_loss.detach().float().item(),
             "phy_loss_weight": phy_loss_weight,
@@ -1253,8 +1329,7 @@ class FlowMatchingObjective(nn.Module):
             expected_shape = loss.shape[:2]
             if action_is_pad.shape != expected_shape:
                 raise ValueError(
-                    f"Flow action_is_pad must have shape {expected_shape}, "
-                    f"got {tuple(action_is_pad.shape)}"
+                    f"Flow action_is_pad must have shape {expected_shape}, got {tuple(action_is_pad.shape)}"
                 )
             mask = ~action_is_pad.to(device=loss.device, dtype=torch.bool).unsqueeze(-1)
             num_valid = mask.sum() * loss.shape[-1]
@@ -1292,8 +1367,7 @@ class FlowMatchingObjective(nn.Module):
         expected_shape = values.shape[:2]
         if action_is_pad.shape != expected_shape:
             raise ValueError(
-                f"Physical action_is_pad must have shape {expected_shape}, "
-                f"got {tuple(action_is_pad.shape)}"
+                f"Physical action_is_pad must have shape {expected_shape}, got {tuple(action_is_pad.shape)}"
             )
 
         # A B-spline derivative at any query point depends on the complete
@@ -1329,10 +1403,9 @@ class FlowMatchingObjective(nn.Module):
                     "Central-difference action derivative requires exactly horizon + 2 "
                     f"({expected_frames}) action frames, got {action_sequence.shape[1]}"
                 )
-            return (
-                action_sequence[:, 2 : self.horizon + 2]
-                - action_sequence[:, : self.horizon]
-            ) * (fps * 0.5)
+            return (action_sequence[:, 2 : self.horizon + 2] - action_sequence[:, : self.horizon]) * (
+                fps * 0.5
+            )
 
         num_samples = self.horizon
         if action_sequence.shape[1] != num_samples:
@@ -1389,17 +1462,9 @@ class FlowMatchingObjective(nn.Module):
             slope = (flow_error[:, 1:2] - flow_error[:, :1]) * fps
             return slope.expand(-1, 2, -1)
 
-        first = (
-            -1.5 * flow_error[:, :1]
-            + 2.0 * flow_error[:, 1:2]
-            - 0.5 * flow_error[:, 2:3]
-        ) * fps
+        first = (-1.5 * flow_error[:, :1] + 2.0 * flow_error[:, 1:2] - 0.5 * flow_error[:, 2:3]) * fps
         interior = (flow_error[:, 2:] - flow_error[:, :-2]) * (fps * 0.5)
-        last = (
-            0.5 * flow_error[:, -3:-2]
-            - 2.0 * flow_error[:, -2:-1]
-            + 1.5 * flow_error[:, -1:]
-        ) * fps
+        last = (0.5 * flow_error[:, -3:-2] - 2.0 * flow_error[:, -2:-1] + 1.5 * flow_error[:, -1:]) * fps
         return torch.cat((first, interior, last), dim=1)
 
     def _kinematic_action_mask(self, reference: Tensor) -> Tensor:
@@ -1532,7 +1597,6 @@ class FlowMatchingObjective(nn.Module):
             fps,
             derivative_conditioning_steps=derivative_conditioning_steps,
         )
-        action_jvp = None
 
         def flow_vector_field_cond(cond: Tensor) -> Tensor:
             return model(x_t, t, conditioning_vec=cond)
@@ -1545,38 +1609,38 @@ class FlowMatchingObjective(nn.Module):
             # only the first call restores the incoming RNG state before the
             # action JVP; the second call then advances it exactly once.
             jvp_rng_devices = [] if x_t.device.type == "cpu" else [x_t.device]
-            jvp_rng_context = (
-                torch.random.fork_rng(devices=jvp_rng_devices, device_type=x_t.device.type)
-                if self.config.use_jvp_ak
-                else nullcontext()
-            )
-            with jvp_rng_context:
+            with torch.random.fork_rng(devices=jvp_rng_devices, device_type=x_t.device.type):
                 predicted_velocity, v_s_dot = torch.func.jvp(
                     flow_vector_field_cond,
                     (conditioning_vec,),
                     (conditioning_dot_vec,),
                 )
-            state_jvp = v_s_dot
 
-            if self.config.use_jvp_ak:
+            def flow_vector_field_action(actions: Tensor) -> Tensor:
+                return model(actions, t, conditioning_vec=conditioning_vec)
 
-                def flow_vector_field_action(actions: Tensor) -> Tensor:
-                    return model(actions, t, conditioning_vec=conditioning_vec)
-
-                _, v_a_k_dot = torch.func.jvp(
-                    flow_vector_field_action,
-                    (x_t,),
-                    (a_dot_data,),
-                )
-                action_jvp = v_a_k_dot
-                v_a_k_dot_for_loss = (
-                    v_a_k_dot.detach() if self.config.stop_gradient_jvp_ak else v_a_k_dot
-                )
-                residual = (1 - t.view(-1, 1, 1)) * (
-                    v_s_dot + t.view(-1, 1, 1) * v_a_k_dot_for_loss - a_dot_data
-                )
+            _, v_a_k_dot = torch.func.jvp(
+                flow_vector_field_action,
+                (x_t,),
+                (a_dot_data,),
+            )
+            action_jvp_grad_scale = float(getattr(self.config, "action_jvp_grad_scale", 1.0))
+            if action_jvp_grad_scale == 0.0:
+                v_a_k_dot_for_loss = v_a_k_dot.detach()
+            elif action_jvp_grad_scale == 1.0:
+                v_a_k_dot_for_loss = v_a_k_dot
             else:
-                residual = v_s_dot - a_dot_data
+                # Forward value: Q. Backward derivative with respect to Q:
+                # action_jvp_grad_scale. This preserves the path-independence
+                # residual while independently conditioning its mixed
+                # parameter/action-input derivative.
+                detached_action_jvp = v_a_k_dot.detach()
+                v_a_k_dot_for_loss = detached_action_jvp + action_jvp_grad_scale * (
+                    v_a_k_dot - detached_action_jvp
+                )
+            residual_core = v_s_dot + t.view(-1, 1, 1) * v_a_k_dot_for_loss - a_dot_data
+            residual_time_weight = 1 - t
+            residual = residual_time_weight.view(-1, 1, 1) * residual_core
 
         kinematic_valid = self._kinematic_valid_mask(
             batch,
@@ -1600,19 +1664,30 @@ class FlowMatchingObjective(nn.Module):
             )
             return torch.sqrt((squared_per_step * valid.float()).sum() / num_valid.float().clamp_min(1))
 
-        jvp_metrics = {}
-        if state_jvp is not None:
-            jvp_metrics["kinematic_state_jvp_rms"] = masked_jvp_rms(state_jvp)
-        if action_jvp is not None:
-            jvp_metrics["kinematic_action_jvp_rms"] = masked_jvp_rms(action_jvp)
+        jvp_metrics = {
+            "kinematic_state_jvp_rms": masked_jvp_rms(v_s_dot),
+            "kinematic_action_jvp_rms": masked_jvp_rms(v_a_k_dot),
+            "kinematic_residual_time_weight_mean": residual_time_weight.mean(),
+            "kinematic_loss_time_weight_mean": residual_time_weight.square().mean(),
+        }
 
         return predicted_velocity, kinematic_loss, kinematic_valid_ratio, jvp_metrics
 
-    def conditional_sample(self, model: nn.Module, batch_size: int, conditioning_vec: Tensor) -> Tensor:
+    def conditional_sample(
+        self,
+        model: nn.Module,
+        batch_size: int,
+        conditioning_vec: Tensor,
+        noise: Tensor | None = None,
+    ) -> Tensor:
         device = next(model.parameters()).device
         dtype = next(model.parameters()).dtype
 
-        x = torch.randn((batch_size, self.horizon, self.action_dim), dtype=dtype, device=device)
+        x = (
+            noise
+            if noise is not None
+            else torch.randn((batch_size, self.horizon, self.action_dim), dtype=dtype, device=device)
+        )
 
         num_steps = self.config.num_integration_steps
         time_grid = torch.linspace(0, 1, num_steps + 1, device=device)

@@ -14,6 +14,7 @@
 import builtins
 import datetime as dt
 import json
+import math
 import os
 import tempfile
 from dataclasses import dataclass, field
@@ -91,6 +92,11 @@ class TrainPipelineConfig(HubMixin):
     # is to use the configuration from the checkpoint, regardless of what's provided with the training
     # command at the time of resumption (CLI `--*` flags still override).
     resume: bool = False
+    # Preserve optimizer moments/RNG/data order while replacing only the LR
+    # scheduler at a resume boundary.  The peak LR is applied to the highest-LR
+    # parameter group; all other groups retain their configured LR ratio.
+    restart_scheduler_on_resume: bool = False
+    restart_scheduler_peak_lr: float | None = None
     # `seed` is used for training (eg: model initialization, dataset shuffling)
     # AND for the evaluation environments.
     seed: int | None = 1000
@@ -100,6 +106,8 @@ class TrainPipelineConfig(HubMixin):
     # Number of workers for the dataloader.
     num_workers: int = 4
     batch_size: int = 8
+    # Number of micro-batches accumulated before each optimizer update.
+    gradient_accumulation_steps: int = 1
     prefetch_factor: int = 4
     persistent_workers: bool = True
     steps: int = 100_000
@@ -215,6 +223,16 @@ class TrainPipelineConfig(HubMixin):
     def validate(self) -> None:
         self._resolve_pretrained_from_cli()
 
+        if (
+            isinstance(self.gradient_accumulation_steps, bool)
+            or not isinstance(self.gradient_accumulation_steps, int)
+            or self.gradient_accumulation_steps < 1
+        ):
+            raise ValueError(
+                "gradient_accumulation_steps must be a positive integer, got "
+                f"{self.gradient_accumulation_steps}"
+            )
+
         if self.policy is None and self.reward_model is None:
             raise ValueError(
                 "Neither policy nor reward_model is configured. "
@@ -222,6 +240,18 @@ class TrainPipelineConfig(HubMixin):
             )
 
         active_cfg = self.trainable_config
+        if self.restart_scheduler_on_resume:
+            if not self.resume:
+                raise ValueError("restart_scheduler_on_resume requires resume=true")
+            if (
+                self.restart_scheduler_peak_lr is None
+                or not math.isfinite(self.restart_scheduler_peak_lr)
+                or self.restart_scheduler_peak_lr <= 0
+            ):
+                raise ValueError(
+                    "restart_scheduler_peak_lr must be finite and > 0 when "
+                    "restart_scheduler_on_resume=true"
+                )
         if self.rename_map and active_cfg.pretrained_path is None:
             raise ValueError(
                 "`rename_map` requires a pretrained policy checkpoint. "

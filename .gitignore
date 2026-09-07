@@ -179,3 +179,9 @@ outputs/
 FAFM/*
 *.pdf
 *.json
+
+# Local robot demonstrations
+arx_data/
+
+# Runtime EGL fallback used by the training launchers
+!nvidia_egl_vendor.json

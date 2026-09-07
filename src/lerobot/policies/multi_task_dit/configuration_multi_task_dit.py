@@ -61,9 +61,18 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     timestep_sampling_beta: float = 1.0  # (beta only) Beta distribution beta
     lambda_flow_k: float = 0.0  # Weight for flow kinematic/JVP loss
     pre_train_steps: int = 0  # Number of initial optimization steps with lambda_flow_k forced to 0
-    use_jvp_ak: bool = False  # Add action-input JVP term to kinematic loss
-    # In the full-horizon JVP loss, keep the action-input JVP value but stop its kinematic gradient.
-    stop_gradient_jvp_ak: bool = False
+    # Optional global-step schedule for the kinematic/JVP weight.  Keeping
+    # lambda_flow_k itself non-zero preserves the derivative-conditioning data
+    # window when an existing checkpoint is branched and the effective weight
+    # is later annealed to zero.
+    lambda_flow_k_schedule: str = "constant"  # "constant" or "cosine"
+    lambda_flow_k_schedule_start_step: int = 0
+    lambda_flow_k_schedule_end_step: int = 0
+    lambda_flow_k_schedule_final: float = 0.0
+    # Kinematic supervision always includes both conditioning and action-input JVPs.
+    # Scale only the direct kinematic-loss gradient through the action-input
+    # JVP. The forward path-independence residual still contains the full JVP.
+    action_jvp_grad_scale: float = 1.0
     phy_loss_weight: float = 0.0  # Weight for the value-level physical residual loss
     gripper_first: bool = True  # Include the final gripper action dimension in kinematic/JVP loss
     sample_frequency: float = 10.0  # Dataset/control frequency in Hz for action derivatives
@@ -123,6 +132,8 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     scheduler_name: str = "cosine"
     scheduler_warmup_steps: int = 0
     do_mask_loss_for_padding: bool = False
+    # Periodically solve the inference ODE and log its action-space MSE. Set to 0 to disable.
+    clean_action_log_freq: int = 100
 
     # Auto-calculated
     drop_n_last_frames: int | None = None
@@ -152,6 +163,14 @@ class MultiTaskDiTConfig(PreTrainedConfig):
             raise ValueError("hidden_dim must be divisible by num_heads")
         if not (0.0 <= self.dropout <= 1.0):
             raise ValueError("dropout must be between 0.0 and 1.0")
+        if (
+            isinstance(self.clean_action_log_freq, bool)
+            or not isinstance(self.clean_action_log_freq, Integral)
+            or self.clean_action_log_freq < 0
+        ):
+            raise ValueError(
+                f"clean_action_log_freq must be a non-negative integer, got {self.clean_action_log_freq}"
+            )
 
         # Vision encoder validation
         self.vision_encoder_type = self.vision_encoder_type.lower()
@@ -192,6 +211,32 @@ class MultiTaskDiTConfig(PreTrainedConfig):
             )
         if self.lambda_flow_k < 0:
             raise ValueError(f"lambda_flow_k must be >= 0, got {self.lambda_flow_k}")
+        if not math.isfinite(self.action_jvp_grad_scale) or not 0.0 <= self.action_jvp_grad_scale <= 1.0:
+            raise ValueError(
+                f"action_jvp_grad_scale must be finite and in [0, 1], got {self.action_jvp_grad_scale}"
+            )
+        self.lambda_flow_k_schedule = self.lambda_flow_k_schedule.lower()
+        if self.lambda_flow_k_schedule not in {"constant", "cosine"}:
+            raise ValueError(
+                f"lambda_flow_k_schedule must be 'constant' or 'cosine', got {self.lambda_flow_k_schedule!r}"
+            )
+        if self.lambda_flow_k_schedule_start_step < 0:
+            raise ValueError(
+                "lambda_flow_k_schedule_start_step must be >= 0, "
+                f"got {self.lambda_flow_k_schedule_start_step}"
+            )
+        if self.lambda_flow_k_schedule_end_step < self.lambda_flow_k_schedule_start_step:
+            raise ValueError(
+                "lambda_flow_k_schedule_end_step must be >= "
+                "lambda_flow_k_schedule_start_step, got "
+                f"{self.lambda_flow_k_schedule_end_step} < "
+                f"{self.lambda_flow_k_schedule_start_step}"
+            )
+        if not math.isfinite(self.lambda_flow_k_schedule_final) or self.lambda_flow_k_schedule_final < 0:
+            raise ValueError(
+                "lambda_flow_k_schedule_final must be finite and >= 0, "
+                f"got {self.lambda_flow_k_schedule_final}"
+            )
         if not math.isfinite(self.phy_loss_weight) or self.phy_loss_weight < 0:
             raise ValueError(f"phy_loss_weight must be finite and >= 0, got {self.phy_loss_weight}")
         if self.phy_loss_weight > 0 and self.objective != "flow_matching":
@@ -203,8 +248,7 @@ class MultiTaskDiTConfig(PreTrainedConfig):
         self.interpolation_mode = self.interpolation_mode.lower()
         if self.interpolation_mode not in {"dct", "bspline"}:
             raise ValueError(
-                "interpolation_mode must be 'dct' or 'bspline', "
-                f"got '{self.interpolation_mode}'"
+                f"interpolation_mode must be 'dct' or 'bspline', got '{self.interpolation_mode}'"
             )
         if not 0 <= self.dct_coe_num <= self.horizon:
             raise ValueError(

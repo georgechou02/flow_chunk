@@ -26,6 +26,56 @@ from lerobot.configs.train import TrainPipelineConfig
 from lerobot.utils.constants import PRETRAINED_MODEL_DIR
 
 
+_LIBERO_DATA_REGIMES_BY_EPISODE_COUNT = {
+    40: "lowdata1",
+    400: "lowdata10",
+}
+_TRAJECTORIES_PER_TASK_BY_DATA_REGIME = {
+    "full": 50,
+    "lowdata1": 1,
+    "lowdata10": 10,
+}
+
+
+def infer_wandb_data_regime(cfg: TrainPipelineConfig) -> str | None:
+    """Return a filterable data-regime label for a training run.
+
+    An explicit ``wandb.data_regime`` wins. Otherwise, LIBERO's common
+    full/one-trajectory/ten-trajectory regimes are inferred from the run
+    descriptor and, as a fallback, the selected episode count.
+    """
+    configured_regime = getattr(cfg.wandb, "data_regime", None)
+    if configured_regime is not None:
+        if configured_regime not in _TRAJECTORIES_PER_TASK_BY_DATA_REGIME:
+            allowed = ", ".join(_TRAJECTORIES_PER_TASK_BY_DATA_REGIME)
+            raise ValueError(f"wandb.data_regime must be one of {allowed}, got {configured_regime!r}")
+        return configured_regime
+
+    if cfg.dataset is None:
+        return None
+    dataset_name = cfg.dataset.repo_id.rstrip("/").rsplit("/", maxsplit=1)[-1].casefold()
+    if dataset_name != "libero":
+        return None
+
+    descriptor = " ".join(
+        str(value).casefold()
+        for value in (cfg.job_name, cfg.output_dir, cfg.wandb.group)
+        if value is not None
+    )
+    # Check lowdata10 first because "lowdata1" is its string prefix.
+    if "lowdata10" in descriptor:
+        return "lowdata10"
+    if "lowdata1" in descriptor:
+        return "lowdata1"
+    if "fulldata" in descriptor:
+        return "full"
+
+    episodes = cfg.dataset.episodes
+    if episodes is None:
+        return "full"
+    return _LIBERO_DATA_REGIMES_BY_EPISODE_COUNT.get(len(episodes))
+
+
 def cfg_to_group(
     cfg: TrainPipelineConfig, return_list: bool = False, truncate_tags: bool = False, max_tag_length: int = 64
 ) -> list[str] | str:
@@ -98,6 +148,14 @@ class WandBLogger:
         )
         wandb_tags = cfg_to_group(cfg, return_list=True, truncate_tags=True) if self.cfg.add_tags else []
         wandb_tags += [tag[:64] for tag in self.cfg.tags]
+        wandb_config = cfg.to_dict()
+        data_regime = infer_wandb_data_regime(cfg)
+        if data_regime is not None:
+            data_regime_tag = f"data_regime:{data_regime}"
+            if data_regime_tag not in wandb_tags:
+                wandb_tags.append(data_regime_tag)
+            wandb_config["data_regime"] = data_regime
+            wandb_config["trajectories_per_task"] = _TRAJECTORIES_PER_TASK_BY_DATA_REGIME[data_regime]
         wandb.init(
             id=wandb_run_id,
             project=self.cfg.project,
@@ -107,7 +165,7 @@ class WandBLogger:
             group=self.cfg.group,
             tags=wandb_tags or None,
             dir=self.log_dir,
-            config=cfg.to_dict(),
+            config=wandb_config,
             # TODO(rcadene): try set to True
             save_code=False,
             # TODO(rcadene): split train and eval, and run async eval with job_type="eval"
