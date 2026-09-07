@@ -5,8 +5,11 @@ from unittest.mock import Mock
 import draccus
 import pytest
 
-from lerobot.configs.default import EvalConfig
-from lerobot.scripts import lerobot_eval
+pytest.importorskip("datasets", reason="Evaluation tests require lerobot[dataset]")
+pytest.importorskip("av", reason="Evaluation requires lerobot[evaluation]")
+
+from lerobot.configs.default import EvalConfig  # noqa: E402
+from lerobot.scripts import lerobot_eval  # noqa: E402
 
 
 @pytest.mark.parametrize("device", [None, "cuda:0"])
@@ -28,10 +31,15 @@ def test_suite_evaluation_forwards_image_device_without_changing_rollouts(monkey
         del env._ensure
     policy = object()
     result = lerobot_eval.eval_policy_all(
-        envs={"libero_10": dict(enumerate(envs))}, policy=policy,
-        env_preprocessor=None, env_postprocessor=None,
-        preprocessor=None, postprocessor=None, n_episodes=50,
-        start_seed=1000, image_preprocessing_device=device,
+        envs={"libero_10": dict(enumerate(envs))},
+        policy=policy,
+        env_preprocessor=None,
+        env_postprocessor=None,
+        preprocessor=None,
+        postprocessor=None,
+        n_episodes=50,
+        start_seed=1000,
+        image_preprocessing_device=device,
     )
     assert result["overall"]["n_episodes"] == 100
     assert result["overall"]["pc_success"] == 50

@@ -87,7 +87,13 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install lerobot with all extras
+        if: github.repository == 'huggingface/lerobot'
         run: uv sync --locked --extra all # TODO(Steven): Make flash-attn optional
+
+      # This fork's complete test suite covers Flow/DiT, datasets and annotations.
+      - name: Install Flow/DiT and annotation test dependencies
+        if: github.repository != 'huggingface/lerobot'
+        run: uv sync --locked --extra test --extra training --extra multi_task_dit --extra annotations
 
       - name: Login to Hugging Face
         if: env.HF_USER_TOKEN != ''
@@ -99,7 +105,12 @@ jobs:
         run: uv run pytest tests -vv --maxfail=10
 
       - name: Run end-to-end tests
+        if: github.repository == 'huggingface/lerobot'
         run: uv run make test-end-to-end
+
+      - name: Run annotation pipeline end-to-end on a synthetic dataset
+        if: github.repository != 'huggingface/lerobot'
+        run: uv run python -m tests.annotations.run_e2e_smoke
 
   # This job builds a GPU enabled image for testing
   # It runs everytime a PR is approved or a push to main

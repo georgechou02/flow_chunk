@@ -25,7 +25,6 @@ from termcolor import colored
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.utils.constants import PRETRAINED_MODEL_DIR
 
-
 _LIBERO_DATA_REGIMES_BY_EPISODE_COUNT = {
     40: "lowdata1",
     400: "lowdata10",

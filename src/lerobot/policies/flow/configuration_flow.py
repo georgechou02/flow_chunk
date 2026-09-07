@@ -153,8 +153,7 @@ class FlowConfig(PreTrainedConfig):
             or self.clean_action_log_freq < 0
         ):
             raise ValueError(
-                "`clean_action_log_freq` must be a non-negative integer. "
-                f"Got {self.clean_action_log_freq}."
+                f"`clean_action_log_freq` must be a non-negative integer. Got {self.clean_action_log_freq}."
             )
 
         supported_timestep_sampling_strategies = ["uniform", "beta"]
@@ -172,10 +171,7 @@ class FlowConfig(PreTrainedConfig):
             or not isinstance(self.pre_train_steps, Integral)
             or self.pre_train_steps < 0
         ):
-            raise ValueError(
-                "`pre_train_steps` must be a non-negative integer. "
-                f"Got {self.pre_train_steps}."
-            )
+            raise ValueError(f"`pre_train_steps` must be a non-negative integer. Got {self.pre_train_steps}.")
         if not math.isfinite(self.phy_loss_weight) or self.phy_loss_weight < 0:
             raise ValueError(
                 f"`phy_loss_weight` must be finite and non-negative. Got {self.phy_loss_weight}."

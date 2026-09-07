@@ -85,6 +85,7 @@ def test_clean_action_log_frequency_rejects_invalid_values(clean_action_log_freq
 
 
 def test_clean_action_metrics_follow_cadence_and_restore_training_state(monkeypatch):
+    pytest.importorskip("diffusers", reason="MultiTaskDiTPolicy requires lerobot[multi_task_dit]")
     config = MultiTaskDiTConfig(
         device="cpu",
         input_features={OBS_STATE: PolicyFeature(FeatureType.STATE, (3,))},

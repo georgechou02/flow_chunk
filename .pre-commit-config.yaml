@@ -15,8 +15,6 @@
 default_language_version:
     python: python3.12
 
-exclude: "tests/artifacts/.*\\.safetensors$"
-
 repos:
   ##### Meta #####
   - repo: meta
@@ -30,6 +28,8 @@ repos:
     hooks:
       - id: check-added-large-files
         args: ['--maxkb=1024']
+        # The generated cross-platform dependency lock includes wheel hashes.
+        exclude: ^uv\.lock$
       - id: debug-statements
       - id: check-merge-conflict
       - id: check-case-conflict

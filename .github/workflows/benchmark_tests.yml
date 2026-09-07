@@ -66,8 +66,10 @@ jobs:
   # Isolated image: lerobot[libero] only (hf-libero, dm-control, mujoco chain)
   libero-integration-test:
     name: Libero — build image + 1-episode eval
+    # Forks must explicitly configure an available GPU runner group.
+    if: github.repository == 'huggingface/lerobot' || vars.GPU_RUNNER_GROUP != ''
     runs-on:
-      group: aws-g6-4xlarge-plus
+      group: ${{ vars.GPU_RUNNER_GROUP || 'aws-g6-4xlarge-plus' }}
     env:
       HF_USER_TOKEN: ${{ secrets.LEROBOT_HF_USER }}
 
@@ -224,8 +226,10 @@ jobs:
   # Isolated image: lerobot[metaworld] only (metaworld==3.0.0, mujoco>=3 chain)
   metaworld-integration-test:
     name: MetaWorld — build image + 1-episode eval
+    # Forks must explicitly configure an available GPU runner group.
+    if: github.repository == 'huggingface/lerobot' || vars.GPU_RUNNER_GROUP != ''
     runs-on:
-      group: aws-g6-4xlarge-plus
+      group: ${{ vars.GPU_RUNNER_GROUP || 'aws-g6-4xlarge-plus' }}
     env:
       HF_USER_TOKEN: ${{ secrets.LEROBOT_HF_USER }}
 
@@ -324,8 +328,10 @@ jobs:
   # Requires an NVIDIA GPU runner with CUDA 12.1 drivers.
   robotwin-integration-test:
     name: RoboTwin 2.0 — build image + 1-episode eval
+    # Forks must explicitly configure an available GPU runner group.
+    if: github.repository == 'huggingface/lerobot' || vars.GPU_RUNNER_GROUP != ''
     runs-on:
-      group: aws-g6-4xlarge-plus
+      group: ${{ vars.GPU_RUNNER_GROUP || 'aws-g6-4xlarge-plus' }}
     env:
       HF_USER_TOKEN: ${{ secrets.LEROBOT_HF_USER }}
       ROBOTWIN_POLICY: lerobot/smolvla_robotwin
@@ -433,8 +439,10 @@ jobs:
   # `lerobot==0.3.3`, which would shadow this repo's lerobot).
   robocasa-integration-test:
     name: RoboCasa365 — build image + 1-episode eval
+    # Forks must explicitly configure an available GPU runner group.
+    if: github.repository == 'huggingface/lerobot' || vars.GPU_RUNNER_GROUP != ''
     runs-on:
-      group: aws-g6-4xlarge-plus
+      group: ${{ vars.GPU_RUNNER_GROUP || 'aws-g6-4xlarge-plus' }}
     env:
       HF_USER_TOKEN: ${{ secrets.LEROBOT_HF_USER }}
 
@@ -534,8 +542,10 @@ jobs:
   # huggingface/lerobot-gpu, which already ships [libero] as part of [all].
   robocerebra-integration-test:
     name: RoboCerebra — build image + 1-episode eval
+    # Forks must explicitly configure an available GPU runner group.
+    if: github.repository == 'huggingface/lerobot' || vars.GPU_RUNNER_GROUP != ''
     runs-on:
-      group: aws-g6-4xlarge-plus
+      group: ${{ vars.GPU_RUNNER_GROUP || 'aws-g6-4xlarge-plus' }}
     env:
       HF_USER_TOKEN: ${{ secrets.LEROBOT_HF_USER }}
 
@@ -640,8 +650,10 @@ jobs:
   # overrides (robomme can't be a pyproject extra due to numpy<2 pin).
   robomme-integration-test:
     name: RoboMME — build image + 1-episode eval
+    # Forks must explicitly configure an available GPU runner group.
+    if: github.repository == 'huggingface/lerobot' || vars.GPU_RUNNER_GROUP != ''
     runs-on:
-      group: aws-g6-4xlarge-plus
+      group: ${{ vars.GPU_RUNNER_GROUP || 'aws-g6-4xlarge-plus' }}
     env:
       HF_USER_TOKEN: ${{ secrets.LEROBOT_HF_USER }}
       ROBOMME_POLICY: lerobot/smolvla_robomme
@@ -745,8 +757,10 @@ jobs:
   # huggingface/lerobot-gpu (see docker/Dockerfile.benchmark.libero_plus).
   libero-plus-integration-test:
     name: LIBERO-plus — build image + 1-episode eval
+    # Forks must explicitly configure an available GPU runner group.
+    if: github.repository == 'huggingface/lerobot' || vars.GPU_RUNNER_GROUP != ''
     runs-on:
-      group: aws-g6-4xlarge-plus
+      group: ${{ vars.GPU_RUNNER_GROUP || 'aws-g6-4xlarge-plus' }}
     env:
       HF_USER_TOKEN: ${{ secrets.LEROBOT_HF_USER }}
       LIBERO_PLUS_SUITE: libero_spatial
@@ -852,8 +866,10 @@ jobs:
   # Isolated image: lerobot[vlabench] only (VLABench, mujoco==3.2.2, dm-control chain)
   vlabench-integration-test:
     name: VLABench — build image + 1-episode eval
+    # Forks must explicitly configure an available GPU runner group.
+    if: github.repository == 'huggingface/lerobot' || vars.GPU_RUNNER_GROUP != ''
     runs-on:
-      group: aws-g6-4xlarge-plus
+      group: ${{ vars.GPU_RUNNER_GROUP || 'aws-g6-4xlarge-plus' }}
     env:
       HF_USER_TOKEN: ${{ secrets.LEROBOT_HF_USER }}
 

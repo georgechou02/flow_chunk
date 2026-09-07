@@ -37,10 +37,8 @@ import pyarrow.parquet as pq
 from libero.libero import benchmark
 from scipy.fft import dct, idct
 
-
 DEFAULT_SNAPSHOT_DIR = (
-    Path.home()
-    / ".cache/huggingface/lerobot/hub/datasets--HuggingFaceVLA--libero/snapshots"
+    Path.home() / ".cache/huggingface/lerobot/hub/datasets--HuggingFaceVLA--libero/snapshots"
 )
 # Match FAFM's convention: M is the highest retained frequency index, so M+1
 # coefficients (modes 0 through M, inclusive) are kept.
@@ -66,9 +64,7 @@ def parse_args() -> argparse.Namespace:
         help="Zero-based task id in the LIBERO environment suite.",
     )
     parser.add_argument("--horizon", type=int, default=32, help="Action chunk length.")
-    parser.add_argument(
-        "--stride", type=int, default=1, help="Sliding-window stride within each episode."
-    )
+    parser.add_argument("--stride", type=int, default=1, help="Sliding-window stride within each episode.")
     parser.add_argument(
         "--arm-dims",
         type=int,
@@ -109,9 +105,7 @@ def resolve_dataset_root(dataset_root: Path | None) -> Path:
         reverse=True,
     )
     if not snapshots:
-        raise FileNotFoundError(
-            f"No usable dataset snapshots found under {DEFAULT_SNAPSHOT_DIR}."
-        )
+        raise FileNotFoundError(f"No usable dataset snapshots found under {DEFAULT_SNAPSHOT_DIR}.")
     return snapshots[0].resolve()
 
 
@@ -218,18 +212,12 @@ def compute_metrics(
         reconstructed = idct(truncated, type=2, axis=1, norm="ortho")
         error = reconstructed - arm_chunks
         abs_error = np.abs(error)
-        retained_energy = float(
-            np.sum(coefficients[:, :coefficient_count, :] ** 2) / total_energy
-        )
+        retained_energy = float(np.sum(coefficients[:, :coefficient_count, :] ** 2) / total_energy)
         per_chunk_energy_retained = np.sum(
             coefficients[:, :coefficient_count, :] ** 2, axis=(1, 2)
-        ) / np.maximum(
-            chunk_total_energy, eps
-        )
+        ) / np.maximum(chunk_total_energy, eps)
         dim_balanced_nrmse = float(np.sqrt(np.mean((error / action_std[None, None, :]) ** 2)))
-        relative_l2 = float(
-            np.sqrt(np.sum(error**2) / max(float(np.sum(arm_chunks**2)), eps))
-        )
+        relative_l2 = float(np.sqrt(np.sum(error**2) / max(float(np.sum(arm_chunks**2)), eps)))
         representation_values = coefficient_count * arm_dims + horizon * non_dct_dims
         rows.append(
             {
@@ -238,19 +226,12 @@ def compute_metrics(
                 "selected": m in selected_m,
                 "arm_coefficient_fraction": coefficient_count / horizon,
                 "total_representation_values": representation_values,
-                "total_representation_fraction": representation_values
-                / original_representation_values,
+                "total_representation_fraction": representation_values / original_representation_values,
                 "compression_factor": original_representation_values / representation_values,
                 "energy_retained": retained_energy,
-                "per_chunk_energy_retained_p10": float(
-                    np.quantile(per_chunk_energy_retained, 0.10)
-                ),
-                "per_chunk_energy_retained_median": float(
-                    np.quantile(per_chunk_energy_retained, 0.50)
-                ),
-                "per_chunk_energy_retained_p90": float(
-                    np.quantile(per_chunk_energy_retained, 0.90)
-                ),
+                "per_chunk_energy_retained_p10": float(np.quantile(per_chunk_energy_retained, 0.10)),
+                "per_chunk_energy_retained_median": float(np.quantile(per_chunk_energy_retained, 0.50)),
+                "per_chunk_energy_retained_p90": float(np.quantile(per_chunk_energy_retained, 0.90)),
                 "rmse": float(np.sqrt(np.mean(error**2))),
                 "mae": float(np.mean(abs_error)),
                 "p95_absolute_error": float(np.quantile(abs_error, 0.95)),
@@ -325,9 +306,7 @@ def dct_analytic_derivative_basis(horizon: int, fps: float) -> np.ndarray:
 def safe_correlation(target: np.ndarray, prediction: np.ndarray) -> float:
     target_centered = target - np.mean(target)
     prediction_centered = prediction - np.mean(prediction)
-    denominator = float(
-        np.sqrt(np.sum(target_centered**2) * np.sum(prediction_centered**2))
-    )
+    denominator = float(np.sqrt(np.sum(target_centered**2) * np.sum(prediction_centered**2)))
     if denominator <= np.finfo(np.float64).eps:
         return 0.0
     return float(np.sum(target_centered * prediction_centered) / denominator)
@@ -365,9 +344,7 @@ def compute_derivative_metrics(
     target_rms = float(np.sqrt(np.mean(dataset_derivative**2)))
     for m in range(horizon):
         coefficient_count = m + 1
-        analytic_derivative = reconstruct_analytic_derivative(
-            coefficients, derivative_basis, m
-        )
+        analytic_derivative = reconstruct_analytic_derivative(coefficients, derivative_basis, m)
         error = analytic_derivative - dataset_derivative
         abs_error = np.abs(error)
         correlations = [
@@ -391,9 +368,7 @@ def compute_derivative_metrics(
                 ),
                 "mean_per_dimension_correlation": float(np.mean(correlations)),
                 "minimum_per_dimension_correlation": float(np.min(correlations)),
-                "analytic_to_dataset_rms_ratio": float(
-                    np.sqrt(np.mean(analytic_derivative**2)) / target_rms
-                ),
+                "analytic_to_dataset_rms_ratio": float(np.sqrt(np.mean(analytic_derivative**2)) / target_rms),
             }
         )
 
@@ -441,9 +416,7 @@ def plot_overview(
         alpha=0.15,
         label="chunk p10-p90",
     )
-    axes[0, 0].plot(
-        metrics["m"], metrics["energy_retained"] * 100, marker="o", markersize=3, label="global"
-    )
+    axes[0, 0].plot(metrics["m"], metrics["energy_retained"] * 100, marker="o", markersize=3, label="global")
     axes[0, 0].plot(
         metrics["m"],
         metrics["per_chunk_energy_retained_median"] * 100,
@@ -558,9 +531,7 @@ def plot_derivative_overview(
     axes[1, 0].set_xticks(selected_m)
     axes[1, 0].grid(alpha=0.25)
 
-    selected = per_dim_derivative_metrics[
-        per_dim_derivative_metrics["m"].isin(selected_m)
-    ]
+    selected = per_dim_derivative_metrics[per_dim_derivative_metrics["m"].isin(selected_m)]
     for name, group in selected.groupby("name", sort=False):
         axes[1, 1].plot(group["m"], group["normalized_rmse"], marker="o", label=name)
     axes[1, 1].set(
@@ -586,17 +557,11 @@ def plot_sample_reconstruction(
     reference_m = min(selected_m, key=lambda value: abs(value - 8))
     reference_coefficient_count = reference_m + 1
     chunk_energy = np.sum(coefficients**2, axis=(1, 2))
-    retained = np.sum(
-        coefficients[:, :reference_coefficient_count, :] ** 2, axis=(1, 2)
-    ) / np.maximum(chunk_energy, np.finfo(np.float64).eps)
-    sample_index = int(np.argmin(np.abs(retained - np.median(retained))))
-    plot_m = sorted(
-        {
-            value
-            for value in selected_m
-            if value in (4, 8, 16, 24, arm_chunks.shape[1] - 1)
-        }
+    retained = np.sum(coefficients[:, :reference_coefficient_count, :] ** 2, axis=(1, 2)) / np.maximum(
+        chunk_energy, np.finfo(np.float64).eps
     )
+    sample_index = int(np.argmin(np.abs(retained - np.median(retained))))
+    plot_m = sorted({value for value in selected_m if value in (4, 8, 16, 24, arm_chunks.shape[1] - 1)})
     if arm_chunks.shape[1] - 1 not in plot_m:
         plot_m.append(arm_chunks.shape[1] - 1)
 
@@ -644,13 +609,7 @@ def plot_sample_derivative_comparison(
 ) -> None:
     sample_index = sample["chunk_index"]
     dataset_derivative = np.diff(arm_chunks[sample_index], axis=0) * fps
-    plot_m = sorted(
-        {
-            value
-            for value in selected_m
-            if value in (8, 16, 24, arm_chunks.shape[1] - 1)
-        }
-    )
+    plot_m = sorted({value for value in selected_m if value in (8, 16, 24, arm_chunks.shape[1] - 1)})
     if arm_chunks.shape[1] - 1 not in plot_m:
         plot_m.append(arm_chunks.shape[1] - 1)
     analytic_derivatives = {
@@ -717,8 +676,7 @@ def write_report(
         f"- Dataset task index: `{summary['dataset_task_index']}`",
         f"- Episodes / frames / chunks: {summary['num_episodes']} / {summary['num_frames']} / {summary['num_chunks']}",
         f"- Chunk horizon / stride: {summary['horizon']} / {summary['stride']}",
-        "- Gripper is not transformed; chunks with a gripper transition: "
-        f"{gripper_transition_percent:.2f}%",
+        f"- Gripper is not transformed; chunks with a gripper transition: {gripper_transition_percent:.2f}%",
         "",
         "## Energy thresholds",
         "",
@@ -749,9 +707,7 @@ def write_report(
             f"{row.per_chunk_energy_retained_p10:.2%} | {row.rmse:.6f} | "
             f"{row.dimension_balanced_nrmse:.4f} |"
         )
-    selected_derivative = derivative_metrics[
-        derivative_metrics["m"].isin(selected_m)
-    ]
+    selected_derivative = derivative_metrics[derivative_metrics["m"].isin(selected_m)]
     lines.extend(
         [
             "",
@@ -833,14 +789,12 @@ def main() -> int:
         non_dct_dims=gripper_chunks.shape[2],
     )
     energy_table = compute_energy_table(coefficients)
-    derivative_metrics, per_dim_derivative_metrics, derivative_std = (
-        compute_derivative_metrics(
-            arm_chunks,
-            coefficients,
-            derivative_basis,
-            fps,
-            set(selected_m),
-        )
+    derivative_metrics, per_dim_derivative_metrics, derivative_std = compute_derivative_metrics(
+        arm_chunks,
+        coefficients,
+        derivative_basis,
+        fps,
+        set(selected_m),
     )
     full_rmse = float(metrics.loc[metrics["m"] == args.horizon - 1, "rmse"].iloc[0])
     if full_rmse > 1e-10:
@@ -884,9 +838,7 @@ def main() -> int:
         & (metrics["dimension_balanced_nrmse"] <= 0.10)
     ]
     recommendation = (
-        recommendation_candidates.iloc[0]
-        if not recommendation_candidates.empty
-        else metrics.iloc[-1]
+        recommendation_candidates.iloc[0] if not recommendation_candidates.empty else metrics.iloc[-1]
     )
 
     summary = {
@@ -918,27 +870,17 @@ def main() -> int:
             "99_percent": first_m_at_threshold(metrics, "energy_retained", 0.99),
         },
         "chunk_p10_energy_threshold_m": {
-            "90_percent": first_m_at_threshold(
-                metrics, "per_chunk_energy_retained_p10", 0.90
-            ),
-            "95_percent": first_m_at_threshold(
-                metrics, "per_chunk_energy_retained_p10", 0.95
-            ),
-            "99_percent": first_m_at_threshold(
-                metrics, "per_chunk_energy_retained_p10", 0.99
-            ),
+            "90_percent": first_m_at_threshold(metrics, "per_chunk_energy_retained_p10", 0.90),
+            "95_percent": first_m_at_threshold(metrics, "per_chunk_energy_retained_p10", 0.95),
+            "99_percent": first_m_at_threshold(metrics, "per_chunk_energy_retained_p10", 0.99),
         },
         "offline_recommendation": {
             "selection_rule": "selected M with chunk p10 energy >= 99% and dimension-balanced NRMSE <= 0.10",
             "m": int(recommendation["m"]),
             "coefficient_count": int(recommendation["coefficient_count"]),
-            "chunk_p10_energy_retained": float(
-                recommendation["per_chunk_energy_retained_p10"]
-            ),
+            "chunk_p10_energy_retained": float(recommendation["per_chunk_energy_retained_p10"]),
             "dimension_balanced_nrmse": float(recommendation["dimension_balanced_nrmse"]),
-            "total_representation_fraction": float(
-                recommendation["total_representation_fraction"]
-            ),
+            "total_representation_fraction": float(recommendation["total_representation_fraction"]),
             "compression_factor": float(recommendation["compression_factor"]),
         },
         "gripper": {
@@ -958,19 +900,13 @@ def main() -> int:
                     "coefficient_count": int(row.coefficient_count),
                     "rmse": float(row.rmse),
                     "dimension_balanced_nrmse": float(row.dimension_balanced_nrmse),
-                    "mean_per_dimension_correlation": float(
-                        row.mean_per_dimension_correlation
-                    ),
-                    "minimum_per_dimension_correlation": float(
-                        row.minimum_per_dimension_correlation
-                    ),
-                    "analytic_to_dataset_rms_ratio": float(
-                        row.analytic_to_dataset_rms_ratio
-                    ),
+                    "mean_per_dimension_correlation": float(row.mean_per_dimension_correlation),
+                    "minimum_per_dimension_correlation": float(row.minimum_per_dimension_correlation),
+                    "analytic_to_dataset_rms_ratio": float(row.analytic_to_dataset_rms_ratio),
                 }
-                for row in derivative_metrics[
-                    derivative_metrics["m"].isin(selected_m)
-                ].itertuples(index=False)
+                for row in derivative_metrics[derivative_metrics["m"].isin(selected_m)].itertuples(
+                    index=False
+                )
             },
         },
         "representative_sample": sample,
@@ -980,16 +916,12 @@ def main() -> int:
     per_dim_metrics.to_csv(output_dir / "per_dimension_metrics.csv", index=False)
     energy_table.to_csv(output_dir / "coefficient_energy.csv", index=False)
     derivative_metrics.to_csv(output_dir / "derivative_metrics.csv", index=False)
-    per_dim_derivative_metrics.to_csv(
-        output_dir / "per_dimension_derivative_metrics.csv", index=False
-    )
+    per_dim_derivative_metrics.to_csv(output_dir / "per_dimension_derivative_metrics.csv", index=False)
     chunk_metadata.to_csv(output_dir / "chunk_index.csv", index=False)
     (output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
     )
-    write_report(
-        output_dir / "report.md", summary, metrics, derivative_metrics, selected_m
-    )
+    write_report(output_dir / "report.md", summary, metrics, derivative_metrics, selected_m)
 
     print(f"episodes={summary['num_episodes']} frames={summary['num_frames']} chunks={summary['num_chunks']}")
     print(f"global_energy_threshold_m={summary['global_energy_threshold_m']}")

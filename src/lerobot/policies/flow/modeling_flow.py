@@ -192,9 +192,7 @@ class FlowPolicy(PreTrainedPolicy):
         data_start = int(uses_central_action_stencil)
         execution_start = self.config.n_obs_steps - 1
         execution_end = execution_start + self.config.n_action_steps
-        target = batch[ACTION][
-            :, data_start + execution_start : data_start + execution_end
-        ]
+        target = batch[ACTION][:, data_start + execution_start : data_start + execution_end]
 
         # A fixed Gaussian prior makes this sparse metric comparable over time and
         # avoids advancing the RNG stream used by the training objective.
@@ -220,9 +218,7 @@ class FlowPolicy(PreTrainedPolicy):
                 :, data_start + execution_start : data_start + execution_end
             ].to(device=squared_error.device, dtype=torch.bool)
         else:
-            valid_steps = torch.ones(
-                squared_error.shape[:2], dtype=torch.bool, device=squared_error.device
-            )
+            valid_steps = torch.ones(squared_error.shape[:2], dtype=torch.bool, device=squared_error.device)
         valid = valid_steps.unsqueeze(-1).expand_as(squared_error)
         clean_action_mse = (squared_error * valid).sum() / valid.sum().clamp_min(1)
         return {
@@ -618,17 +614,9 @@ class FlowModel(nn.Module):
             slope = (flow_error[:, 1:2] - flow_error[:, :1]) * fps
             return slope.expand(-1, 2, -1)
 
-        first = (
-            -1.5 * flow_error[:, :1]
-            + 2.0 * flow_error[:, 1:2]
-            - 0.5 * flow_error[:, 2:3]
-        ) * fps
+        first = (-1.5 * flow_error[:, :1] + 2.0 * flow_error[:, 1:2] - 0.5 * flow_error[:, 2:3]) * fps
         interior = (flow_error[:, 2:] - flow_error[:, :-2]) * (fps * 0.5)
-        last = (
-            0.5 * flow_error[:, -3:-2]
-            - 2.0 * flow_error[:, -2:-1]
-            + 1.5 * flow_error[:, -1:]
-        ) * fps
+        last = (0.5 * flow_error[:, -3:-2] - 2.0 * flow_error[:, -2:-1] + 1.5 * flow_error[:, -1:]) * fps
         return torch.cat((first, interior, last), dim=1)
 
     def _conditioning_dot(
@@ -836,8 +824,7 @@ class FlowModel(nn.Module):
         expected_shape = values.shape[:2]
         if action_is_pad.shape != expected_shape:
             raise ValueError(
-                f"Physical action_is_pad must have shape {expected_shape}, "
-                f"got {tuple(action_is_pad.shape)}."
+                f"Physical action_is_pad must have shape {expected_shape}, got {tuple(action_is_pad.shape)}."
             )
 
         # A B-spline derivative at every query point depends on the full fitted

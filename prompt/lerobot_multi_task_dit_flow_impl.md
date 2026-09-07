@@ -847,7 +847,7 @@ kinematic_loss = mean(sum(kinematic_residual^2 over action_dim) * not_done)
 
 `multi_task_dit` 完全没有这部分。它不会使用 `delta_a`、`next_actions`、`next_observations - observations`，也不会约束 velocity field 对 state/action 的导数。
 
-这是两者最核心的区别：  
+这是两者最核心的区别：
 `multi_task_dit` 是标准条件生成式 flow matching；`bc_only.py` 是 flow BC 再叠加一个和 action dynamics 一致性有关的高阶监督项。
 
 ### 7. sequence mask 和 episode 边界处理不同
@@ -896,22 +896,22 @@ action_chunk = np.array(action_chunk).reshape(-1, action_dim)
 
 ## 简短对照表
 
-| 维度 | `multi_task_dit` flow | `bc_only.py` flow chunk |
-| --- | --- | --- |
-| 框架 | PyTorch + LeRobot `PreTrainedPolicy` | JAX/Flax agent |
-| policy 开关 | `policy.type=multi_task_dit`, `objective=flow_matching` | `policy_type="flow"`, `action_chunking=True` |
-| action 表示 | `(B, horizon, action_dim)` | flatten 成 `(B, H * action_dim)` |
-| 网络 | DiT transformer over action tokens | `ActorVectorField` MLP |
-| 条件 | state history + CLIP image + CLIP text | 当前 observation，可选 encoder |
-| 时间窗口 | observation/action delta indices 对齐，包含历史 offset | `sample_sequence` 从当前 index 取未来 H 步 |
-| 基础 loss | flow matching velocity MSE | flow matching velocity MSE |
-| 额外 loss | 无 | kinematic/JVP high-order loss |
-| action dynamics target | 不使用 | 使用 `delta_a` 或 `next_actions - actions` |
-| state/action JVP | 无 | 有 state JVP，可选 action JVP |
-| padding/valid mask | 可选 `action_is_pad` | `valid * masks` 显式进入 loss |
-| 推理 solver | Euler 或 RK4 | Euler |
-| 默认采样步数 | 100 | 10 |
-| 输出执行 | LeRobot policy action queue | evaluation 代码手写 action queue |
+| 维度                   | `multi_task_dit` flow                                   | `bc_only.py` flow chunk                      |
+| ---------------------- | ------------------------------------------------------- | -------------------------------------------- |
+| 框架                   | PyTorch + LeRobot `PreTrainedPolicy`                    | JAX/Flax agent                               |
+| policy 开关            | `policy.type=multi_task_dit`, `objective=flow_matching` | `policy_type="flow"`, `action_chunking=True` |
+| action 表示            | `(B, horizon, action_dim)`                              | flatten 成 `(B, H * action_dim)`             |
+| 网络                   | DiT transformer over action tokens                      | `ActorVectorField` MLP                       |
+| 条件                   | state history + CLIP image + CLIP text                  | 当前 observation，可选 encoder               |
+| 时间窗口               | observation/action delta indices 对齐，包含历史 offset  | `sample_sequence` 从当前 index 取未来 H 步   |
+| 基础 loss              | flow matching velocity MSE                              | flow matching velocity MSE                   |
+| 额外 loss              | 无                                                      | kinematic/JVP high-order loss                |
+| action dynamics target | 不使用                                                  | 使用 `delta_a` 或 `next_actions - actions`   |
+| state/action JVP       | 无                                                      | 有 state JVP，可选 action JVP                |
+| padding/valid mask     | 可选 `action_is_pad`                                    | `valid * masks` 显式进入 loss                |
+| 推理 solver            | Euler 或 RK4                                            | Euler                                        |
+| 默认采样步数           | 100                                                     | 10                                           |
+| 输出执行               | LeRobot policy action queue                             | evaluation 代码手写 action queue             |
 
 ## 可以这样理解
 

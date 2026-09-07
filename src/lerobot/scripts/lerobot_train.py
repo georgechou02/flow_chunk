@@ -70,7 +70,6 @@ from lerobot.utils.utils import (
 
 from .lerobot_eval import eval_policy_all
 
-
 _PER_STEP_PHYSICAL_METRICS = ("physical_loss", "weighted_physical_loss")
 _PER_STEP_CLEAN_ACTION_METRICS = ("clean_action_mse", "clean_action_valid_ratio")
 
@@ -619,9 +618,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     # MetricsTracker multiplies its batch size by world size, so include only
     # the per-rank accumulation factor in the value passed to it.
-    effective_batch_size = (
-        cfg.batch_size * accelerator.num_processes * cfg.gradient_accumulation_steps
-    )
+    effective_batch_size = cfg.batch_size * accelerator.num_processes * cfg.gradient_accumulation_steps
     physical_global_batch_size = cfg.batch_size * accelerator.num_processes
     train_tracker = MetricsTracker(
         cfg.batch_size * cfg.gradient_accumulation_steps,
@@ -779,8 +776,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 videos_dir = None
                 if cfg.eval.max_episodes_rendered > 0:
                     videos_dir = (
-                        (cfg.env_eval_output_dir or cfg.output_dir / "eval") / f"videos_step_{step_id}"
-                    )
+                        cfg.env_eval_output_dir or cfg.output_dir / "eval"
+                    ) / f"videos_step_{step_id}"
                 with torch.no_grad(), accelerator.autocast():
                     eval_info = eval_policy_all(
                         envs=eval_env,  # dict[suite][task_id] -> vec_env

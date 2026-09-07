@@ -29,7 +29,6 @@ import pandas as pd
 from scipy.fft import dct
 from scipy.special import expit
 
-
 DIMENSION_NAMES = ["f0", "f1", "f2", "f3", "f4", "f5"]
 DEFAULT_M_VALUES = "1,2,4,8,12,16,24,31"
 
@@ -114,9 +113,7 @@ def complex_function(t: np.ndarray, period: float) -> tuple[np.ndarray, np.ndarr
     amplitude = 0.62 + 0.23 * np.cos(modulation_phase)
     damplitude = -0.23 * two_pi * 0.30 * np.sin(modulation_phase)
     latent5 = amplitude * np.sin(carrier_phase)
-    dlatent5 = damplitude * np.sin(carrier_phase) + amplitude * two_pi * 2.55 * np.cos(
-        carrier_phase
-    )
+    dlatent5 = damplitude * np.sin(carrier_phase) + amplitude * two_pi * 2.55 * np.cos(carrier_phase)
 
     local_center = 0.77 * period
     local_width = 0.065 * period
@@ -124,9 +121,7 @@ def complex_function(t: np.ndarray, period: float) -> tuple[np.ndarray, np.ndarr
     denvelope = -(t - local_center) / local_width**2 * envelope
     local_phase = two_pi * 4.10 * t - 0.30
     latent6 = envelope * np.cos(local_phase)
-    dlatent6 = denvelope * np.cos(local_phase) - envelope * two_pi * 4.10 * np.sin(
-        local_phase
-    )
+    dlatent6 = denvelope * np.cos(local_phase) - envelope * two_pi * 4.10 * np.sin(local_phase)
 
     centered_u = u - 0.5
     latent7 = 2.0 * centered_u**3 - 0.35 * centered_u
@@ -203,9 +198,7 @@ def coupled_base_state(t: np.ndarray, period: float) -> tuple[np.ndarray, np.nda
 
     modulation_phase = two_pi * 0.37 * t
     phase0 = two_pi * (0.55 * t + 0.13 * np.sin(modulation_phase)) + 0.15
-    dphase0 = two_pi * (
-        0.55 + 0.13 * two_pi * 0.37 * np.cos(modulation_phase)
-    )
+    dphase0 = two_pi * (0.55 + 0.13 * two_pi * 0.37 * np.cos(modulation_phase))
     exponential0 = np.exp(0.75 * (t / period - 0.5))
     state0 = 0.55 * np.sin(phase0) + 0.11 * (exponential0 - 1.0)
     dstate0 = 0.55 * dphase0 * np.cos(phase0) + 0.11 * 0.75 / period * exponential0
@@ -287,23 +280,18 @@ def coupled_base_state(t: np.ndarray, period: float) -> tuple[np.ndarray, np.nda
         window_width * np.logaddexp(0.0, (t - window_start) / window_width)
         - window_width * np.logaddexp(0.0, (t - window_end) / window_width)
     ) / (window_end - window_start)
-    dwindow = (
-        expit((t - window_start) / window_width)
-        - expit((t - window_end) / window_width)
-    ) / (window_end - window_start)
+    dwindow = (expit((t - window_start) / window_width) - expit((t - window_end) / window_width)) / (
+        window_end - window_start
+    )
     state5 = 0.34 * ring5a - 0.30 * ring5b + 0.16 * window
     dstate5 = 0.34 * dring5a - 0.30 * dring5b + 0.16 * dwindow
 
     state = np.stack([state0, state1, state2, state3, state4, state5], axis=-1)
-    derivative = np.stack(
-        [dstate0, dstate1, dstate2, dstate3, dstate4, dstate5], axis=-1
-    )
+    derivative = np.stack([dstate0, dstate1, dstate2, dstate3, dstate4, dstate5], axis=-1)
     return state, derivative
 
 
-def coupled_delayed_exponential_function(
-    t: np.ndarray, period: float
-) -> tuple[np.ndarray, np.ndarray]:
+def coupled_delayed_exponential_function(t: np.ndarray, period: float) -> tuple[np.ndarray, np.ndarray]:
     """Six-dimensional analytic system with explicit instantaneous and delayed coupling."""
 
     t = np.asarray(t, dtype=np.float64)
@@ -329,20 +317,14 @@ def coupled_delayed_exponential_function(
     delay_widths = period * np.array([0.018, 0.020, 0.022, 0.024, 0.026, 0.028])
     delayed_sources = []
     ddelayed_sources = []
-    for source_dim, (delay, width) in enumerate(zip(delays, delay_widths)):
+    for source_dim, (delay, width) in enumerate(zip(delays, delay_widths, strict=True)):
         shifted_base, shifted_derivative = coupled_base_state(t - delay, period)
         gate = expit((t - delay) / width)
         dgate = gate * (1.0 - gate) / width
         shifted_nonlinear = np.tanh(1.6 * shifted_base[..., source_dim])
-        dshifted_nonlinear = (
-            1.6
-            * (1.0 - shifted_nonlinear**2)
-            * shifted_derivative[..., source_dim]
-        )
+        dshifted_nonlinear = 1.6 * (1.0 - shifted_nonlinear**2) * shifted_derivative[..., source_dim]
         delayed_sources.append(gate * shifted_nonlinear)
-        ddelayed_sources.append(
-            dgate * shifted_nonlinear + gate * dshifted_nonlinear
-        )
+        ddelayed_sources.append(dgate * shifted_nonlinear + gate * dshifted_nonlinear)
     delayed_sources_array = np.stack(delayed_sources, axis=-1)
     ddelayed_sources_array = np.stack(ddelayed_sources, axis=-1)
     delayed_coupling = np.array(
@@ -384,18 +366,12 @@ def coupled_delayed_exponential_function(
     bilinear_scale = np.array([0.22, -0.18, 0.24, -0.20, 0.19, -0.21])
 
     dimension_scale = np.array([1.00, 0.92, 1.08, 0.82, 0.88, 0.96])
-    values = (
-        base + instantaneous + delayed + bilinear_scale * bilinear
-    ) * dimension_scale
-    derivatives = (
-        dbase + dinstantaneous + ddelayed + bilinear_scale * dbilinear
-    ) * dimension_scale
+    values = (base + instantaneous + delayed + bilinear_scale * bilinear) * dimension_scale
+    derivatives = (dbase + dinstantaneous + ddelayed + bilinear_scale * dbilinear) * dimension_scale
     return values, derivatives
 
 
-def evaluate_source_function(
-    t: np.ndarray, period: float, variant: str
-) -> tuple[np.ndarray, np.ndarray]:
+def evaluate_source_function(t: np.ndarray, period: float, variant: str) -> tuple[np.ndarray, np.ndarray]:
     if variant == "original":
         return complex_function(t, period)
     if variant == "coupled_delayed_exponential":
@@ -429,11 +405,7 @@ def evaluate_dct(
     )
     basis = dct_scale(num_samples)[: m + 1, None]
     if derivative:
-        basis = (
-            -basis
-            * (np.pi * frequency[:, None] * fps / num_samples)
-            * np.sin(phase)
-        )
+        basis = -basis * (np.pi * frequency[:, None] * fps / num_samples) * np.sin(phase)
     else:
         basis = basis * np.cos(phase)
     return np.einsum("kt,kd->td", basis, coefficients[: m + 1], optimize=True)
@@ -477,13 +449,9 @@ def compute_metrics(
     current_time = sample_time[:-1]
 
     for m in range(len(sample_time)):
-        reconstructed_samples = evaluate_dct(
-            coefficients, sample_time, fps, m, derivative=False
-        )
+        reconstructed_samples = evaluate_dct(coefficients, sample_time, fps, m, derivative=False)
         reconstructed_dense = evaluate_dct(coefficients, dense_time, fps, m, derivative=False)
-        dct_derivative = evaluate_dct(
-            coefficients, current_time, fps, m, derivative=True
-        )
+        dct_derivative = evaluate_dct(coefficients, current_time, fps, m, derivative=True)
 
         sample_error = reconstructed_samples - samples
         dense_error = reconstructed_dense - true_dense
@@ -500,16 +468,10 @@ def compute_metrics(
                 "continuous_function_nrmse": balanced_nrmse(dense_error, true_dense),
                 "finite_difference_derivative_rmse": float(np.sqrt(np.mean(fd_error**2))),
                 "finite_difference_derivative_nrmse": balanced_nrmse(fd_error, finite_difference),
-                "finite_difference_derivative_correlation": correlation(
-                    finite_difference, dct_derivative
-                ),
+                "finite_difference_derivative_correlation": correlation(finite_difference, dct_derivative),
                 "true_derivative_rmse": float(np.sqrt(np.mean(true_derivative_error**2))),
-                "true_derivative_nrmse": balanced_nrmse(
-                    true_derivative_error, true_derivative_current
-                ),
-                "true_derivative_correlation": correlation(
-                    true_derivative_current, dct_derivative
-                ),
+                "true_derivative_nrmse": balanced_nrmse(true_derivative_error, true_derivative_current),
+                "true_derivative_correlation": correlation(true_derivative_current, dct_derivative),
             }
         )
 
@@ -520,18 +482,10 @@ def compute_metrics(
                     "coefficient_count": m + 1,
                     "dimension": dim,
                     "name": name,
-                    "sample_reconstruction_rmse": float(
-                        np.sqrt(np.mean(sample_error[:, dim] ** 2))
-                    ),
-                    "continuous_function_rmse": float(
-                        np.sqrt(np.mean(dense_error[:, dim] ** 2))
-                    ),
-                    "finite_difference_derivative_rmse": float(
-                        np.sqrt(np.mean(fd_error[:, dim] ** 2))
-                    ),
-                    "true_derivative_rmse": float(
-                        np.sqrt(np.mean(true_derivative_error[:, dim] ** 2))
-                    ),
+                    "sample_reconstruction_rmse": float(np.sqrt(np.mean(sample_error[:, dim] ** 2))),
+                    "continuous_function_rmse": float(np.sqrt(np.mean(dense_error[:, dim] ** 2))),
+                    "finite_difference_derivative_rmse": float(np.sqrt(np.mean(fd_error[:, dim] ** 2))),
+                    "true_derivative_rmse": float(np.sqrt(np.mean(true_derivative_error[:, dim] ** 2))),
                 }
             )
     return pd.DataFrame(rows), pd.DataFrame(per_dim_rows)
@@ -561,9 +515,7 @@ def plot_signal_comparison(
     axes[0].legend(ncols=min(6, len(plot_m) + 2), fontsize=8)
     axes[-1].set_xlabel("Time (seconds)")
     noise_text = "noisy " if samples_are_noisy else ""
-    fig.suptitle(
-        f"Continuous function and {noise_text}discrete samples vs. FAFM-style DCT reconstruction"
-    )
+    fig.suptitle(f"Continuous function and {noise_text}discrete samples vs. FAFM-style DCT reconstruction")
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
 
@@ -599,18 +551,14 @@ def plot_derivative_comparison(
             label="forward difference at current sample",
         )
         for m in plot_m:
-            derivative = evaluate_dct(
-                coefficients, derivative_dense_time, fps, m, derivative=True
-            )
+            derivative = evaluate_dct(coefficients, derivative_dense_time, fps, m, derivative=True)
             axis.plot(derivative_dense_time, derivative[:, dim], linewidth=1.2, label=f"DCT analytic M={m}")
         axis.set_ylabel(f"d{DIMENSION_NAMES[dim]}/dt")
         axis.grid(alpha=0.2)
     axes[0].legend(ncols=min(6, len(plot_m) + 2), fontsize=8)
     axes[-1].set_xlabel("Current sample time (seconds)")
     source_text = " from noisy samples" if samples_are_noisy else ""
-    fig.suptitle(
-        f"Forward finite difference vs. FAFM-style DCT analytic derivative{source_text}"
-    )
+    fig.suptitle(f"Forward finite difference vs. FAFM-style DCT analytic derivative{source_text}")
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
 
@@ -644,9 +592,7 @@ def compute_derivative_method_metrics(
                 "dimension_balanced_nrmse": balanced_nrmse(error, true_derivative),
                 "mae": float(np.mean(np.abs(error))),
                 "p95_absolute_error": float(np.quantile(np.abs(error), 0.95)),
-                "mean_per_dimension_correlation": correlation(
-                    true_derivative, prediction
-                ),
+                "mean_per_dimension_correlation": correlation(true_derivative, prediction),
             }
         )
         for dim, name in enumerate(DIMENSION_NAMES):
@@ -694,8 +640,7 @@ def plot_derivative_methods_vs_true(
     forward_difference = np.diff(samples, axis=0)[1:] * fps
     central_difference = (samples[2:] - samples[:-2]) * (0.5 * fps)
     dct_derivatives = {
-        m: evaluate_dct(coefficients, common_time, fps, m, derivative=True)
-        for m in comparison_m
+        m: evaluate_dct(coefficients, common_time, fps, m, derivative=True) for m in comparison_m
     }
     dct_colors = ["tab:blue", "tab:purple", "tab:red", "tab:brown"]
 
@@ -726,7 +671,7 @@ def plot_derivative_methods_vs_true(
             linewidth=1.2,
             label="central difference",
         )
-        for (m, derivative), color in zip(dct_derivatives.items(), dct_colors):
+        for (m, derivative), color in zip(dct_derivatives.items(), dct_colors, strict=False):
             axis.plot(
                 common_time,
                 derivative[:, dim],
@@ -740,8 +685,7 @@ def plot_derivative_methods_vs_true(
     axes[-1].set_xlabel("Common interior sample time (seconds)")
     source_text = " (estimators use noisy samples)" if samples_are_noisy else ""
     fig.suptitle(
-        "Forward difference, central difference, and DCT analytic derivative vs. truth"
-        + source_text
+        "Forward difference, central difference, and DCT analytic derivative vs. truth" + source_text
     )
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
@@ -791,11 +735,7 @@ def plot_derivative_method_errors(
     for index, (method, m, label) in enumerate(method_specs):
         selected = per_dim_method_metrics[
             (per_dim_method_metrics["method"] == method)
-            & (
-                per_dim_method_metrics["m"].isna()
-                if m is None
-                else per_dim_method_metrics["m"].eq(m)
-            )
+            & (per_dim_method_metrics["m"].isna() if m is None else per_dim_method_metrics["m"].eq(m))
         ].sort_values("dimension")
         axes[1, 1].bar(
             x + (index - (len(method_specs) - 1) / 2) * width,
@@ -906,10 +846,7 @@ def write_report(
         ]
     )
     for m in comparison_m:
-        row = method_metrics[
-            (method_metrics["method"] == "dct_analytic")
-            & method_metrics["m"].eq(m)
-        ].iloc[0]
+        row = method_metrics[(method_metrics["method"] == "dct_analytic") & method_metrics["m"].eq(m)].iloc[0]
         lines.append(
             f"| DCT analytic M={m} | {row.rmse:.6f} | "
             f"{row.dimension_balanced_nrmse:.6f} | "
@@ -959,9 +896,7 @@ def main() -> int:
         sample_time, period, args.function_variant
     )
     true_dense, _ = evaluate_source_function(dense_time, period, args.function_variant)
-    _, true_derivative_dense = evaluate_source_function(
-        derivative_dense_time, period, args.function_variant
-    )
+    _, true_derivative_dense = evaluate_source_function(derivative_dense_time, period, args.function_variant)
     noise_std = args.noise_std_fraction * np.std(clean_samples, axis=0)
     rng = np.random.default_rng(args.noise_seed)
     sample_noise = rng.normal(size=clean_samples.shape) * noise_std[None, :]
@@ -1046,9 +981,7 @@ def main() -> int:
     finite_difference_baseline = {
         "rmse": float(np.sqrt(np.mean(baseline_error**2))),
         "nrmse": balanced_nrmse(baseline_error, true_derivative_current),
-        "mean_per_dimension_correlation": correlation(
-            true_derivative_current, finite_difference
-        ),
+        "mean_per_dimension_correlation": correlation(true_derivative_current, finite_difference),
     }
     summary = {
         "function_variant": args.function_variant,
@@ -1082,13 +1015,10 @@ def main() -> int:
             str(row.method if row.method != "dct_analytic" else f"dct_m{int(row.m)}"): {
                 "rmse": float(row.rmse),
                 "dimension_balanced_nrmse": float(row.dimension_balanced_nrmse),
-                "mean_per_dimension_correlation": float(
-                    row.mean_per_dimension_correlation
-                ),
+                "mean_per_dimension_correlation": float(row.mean_per_dimension_correlation),
             }
             for row in method_metrics[
-                (method_metrics["method"] != "dct_analytic")
-                | method_metrics["m"].isin(comparison_m)
+                (method_metrics["method"] != "dct_analytic") | method_metrics["m"].isin(comparison_m)
             ].itertuples(index=False)
         },
         "selected_metrics": {
@@ -1124,9 +1054,7 @@ def main() -> int:
     metrics.to_csv(output_dir / "metrics.csv", index=False)
     per_dim_metrics.to_csv(output_dir / "per_dimension_metrics.csv", index=False)
     method_metrics.to_csv(output_dir / "derivative_method_metrics.csv", index=False)
-    per_dim_method_metrics.to_csv(
-        output_dir / "derivative_method_per_dimension_metrics.csv", index=False
-    )
+    per_dim_method_metrics.to_csv(output_dir / "derivative_method_per_dimension_metrics.csv", index=False)
     (output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
     )

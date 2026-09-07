@@ -657,4 +657,3 @@ delta_a[:, :-1] = action[:, 1:] - action[:, :-1]
 ```
 
 这里把训练/推理 scheduler 设为 DDIM，训练 timestep 默认 100，推理只跑 32 步 denoising。`do_mask_loss_for_padding=true` 对 LIBERO 这种 episode window 很重要，否则末尾 clamp/pad 出来的 action 会进入 loss。
-

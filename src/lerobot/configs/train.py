@@ -249,8 +249,7 @@ class TrainPipelineConfig(HubMixin):
                 or self.restart_scheduler_peak_lr <= 0
             ):
                 raise ValueError(
-                    "restart_scheduler_peak_lr must be finite and > 0 when "
-                    "restart_scheduler_on_resume=true"
+                    "restart_scheduler_peak_lr must be finite and > 0 when restart_scheduler_on_resume=true"
                 )
         if self.rename_map and active_cfg.pretrained_path is None:
             raise ValueError(

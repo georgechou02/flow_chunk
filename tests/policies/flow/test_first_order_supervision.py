@@ -133,9 +133,7 @@ def test_pretraining_disables_kinematic_loss_until_global_step_boundary():
     assert metrics["train_step"] == 2
     assert metrics["lambda_flow_k"] == pytest.approx(0.2)
     assert metrics["kinematic_loss"] > 0
-    assert loss.item() == pytest.approx(
-        metrics["flow_loss"] + 0.2 * metrics["kinematic_loss"]
-    )
+    assert loss.item() == pytest.approx(metrics["flow_loss"] + 0.2 * metrics["kinematic_loss"])
 
 
 @pytest.mark.parametrize("clean_action_log_freq", [-1, 1.5, True])
@@ -384,9 +382,7 @@ def test_dct_physical_loss_matches_value_level_formula_and_backpropagates(monkey
 
     torch.testing.assert_close(loss, expected_total)
     assert metrics["physical_loss"] == pytest.approx(expected_physical_loss.item())
-    assert metrics["weighted_physical_loss"] == pytest.approx(
-        (weight * expected_physical_loss).item()
-    )
+    assert metrics["weighted_physical_loss"] == pytest.approx((weight * expected_physical_loss).item())
     assert metrics["phy_loss_weight"] == weight
     loss.backward()
     assert model.scale.grad is not None
@@ -442,9 +438,7 @@ def test_bspline_physical_loss_excludes_discrete_gripper(monkeypatch):
 def test_bspline_physical_loss_excludes_entire_padded_chunk():
     policy = FlowPolicy(_make_config(lambda_flow_k=0.0, phy_loss_weight=1.0))
     values = torch.stack((torch.ones(8, 2), torch.full((8, 2), 100.0)))
-    action_is_pad = torch.tensor(
-        [[False] * 8, [False, False, True, False, False, False, False, False]]
-    )
+    action_is_pad = torch.tensor([[False] * 8, [False, False, True, False, False, False, False, False]])
 
     actual = policy.flow._physical_residual_mean(values, action_is_pad)
 

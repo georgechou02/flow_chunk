@@ -2,8 +2,13 @@
 
 from unittest.mock import Mock
 
-from lerobot.common.wandb_utils import WandBLogger
-from lerobot.scripts.lerobot_train import _log_per_step_physical_metrics
+import pytest
+
+pytest.importorskip("accelerate", reason="Training requires lerobot[training]")
+pytest.importorskip("datasets", reason="Training requires lerobot[training]")
+
+from lerobot.common.wandb_utils import WandBLogger  # noqa: E402
+from lerobot.scripts.lerobot_train import _log_per_step_physical_metrics  # noqa: E402
 
 
 def test_physical_metrics_are_logged_between_regular_log_steps():

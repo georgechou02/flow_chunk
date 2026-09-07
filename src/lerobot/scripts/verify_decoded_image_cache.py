@@ -32,13 +32,9 @@ def _assert_items_equal(source: dict, cached: dict, index: int) -> None:
                     if source_value.is_floating_point()
                     else None
                 )
-                raise AssertionError(
-                    f"Item {index} tensor {key!r} differs; max_abs_diff={max_abs_diff}."
-                )
+                raise AssertionError(f"Item {index} tensor {key!r} differs; max_abs_diff={max_abs_diff}.")
         elif source_value != cached_value:
-            raise AssertionError(
-                f"Item {index} value {key!r} differs: {source_value!r} != {cached_value!r}."
-            )
+            raise AssertionError(f"Item {index} value {key!r} differs: {source_value!r} != {cached_value!r}.")
 
 
 def _seed_augmentation(seed: int) -> None:

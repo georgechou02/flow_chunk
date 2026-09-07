@@ -9,8 +9,10 @@ import numpy as np
 import pytest
 import torch
 
-from lerobot.datasets.decoded_image_cache import DecodedImageCache, dataset_cache_identity
-from lerobot.scripts.build_decoded_image_cache import ShardedCacheWriter
+pytest.importorskip("datasets", reason="Cache builder requires lerobot[dataset]")
+
+from lerobot.datasets.decoded_image_cache import DecodedImageCache, dataset_cache_identity  # noqa: E402
+from lerobot.scripts.build_decoded_image_cache import ShardedCacheWriter  # noqa: E402
 
 
 def _make_meta(source_root: Path, total_frames: int = 5):

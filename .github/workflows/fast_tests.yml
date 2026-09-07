@@ -126,3 +126,10 @@ jobs:
 
       - name: "Tier 4 — Test: viz"
         run: uv run pytest tests -vv --maxfail=10
+
+      # Exercise Flow/DiT and the training entry points with their optional dependencies installed.
+      - name: "Tier 5 — Install: training and Flow/DiT"
+        run: uv sync --locked --extra test --extra training --extra multi_task_dit
+
+      - name: "Tier 5 — Test: training and Flow/DiT"
+        run: uv run pytest tests -vv --maxfail=10

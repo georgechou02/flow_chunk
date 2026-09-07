@@ -733,4 +733,3 @@ DiffusionPolicy 的 action chunk / history / U-Net 框架
 ```
 
 所以它和 diffusion policy 的工程骨架非常接近，但数学目标不同。对你想验证的 kinematic loss 来说，`flow` 是更自然的切入点，`diffusion` 更适合作为架构参考和 baseline，不适合作为第一版 kinetic loss 的直接承载对象。
-
